@@ -4,6 +4,7 @@
 #include <regex>
 #include <unordered_map>
 #include <stack>
+#include <iomanip>
 
 /*
 	Fn FuncName arg0, arg1:
@@ -18,9 +19,43 @@
 	Const y = x+1*2/FuncName(32, 64);
 */
 
-#define encode_double_0( dbl ) (uint32_t)(( *(uint64_t*)(&dbl) & 0xFFFFFFFF00000000LL) >> 32);
-#define encode_double_1( dbl ) (uint32_t)(( *(uint64_t*)(&dbl) & 0xFFFFFFFFLL));
-#define decode_double( target, part0, part1 ) (*reinterpret_cast<uint64_t*>(&target) = ((uint64_t)part0 << 32 | part1));
+struct Disassembly;
+struct Program;
+
+void print_disassembly( const Disassembly& disasm );
+bool disassemble( const Program& program, Disassembly* disasm );
+
+struct Disassembly {
+	struct OpCode {
+		OpCode( uint32_t len, const std::string& instName, const std::string& instArgs ) {
+			length = len;
+			name = instName;
+			args = instArgs;
+		}
+
+		uint32_t length;
+		uint32_t address;
+		std::string name;
+		std::string args;
+	};
+
+	struct Fn {
+		std::string name;
+		std::vector< OpCode > opcodes;
+	};
+
+	std::vector< Fn > functions;
+};
+
+struct encoded_value {
+	union {
+		uint8_t		uint8[ 8 ];
+		uint16_t	uint16[ 4 ];
+		uint32_t	uint32[ 2 ];
+		int32_t		int32[ 2 ];
+		double		dbl;
+	} data;
+};
 
 enum FunctionType {
 	fn_global,
@@ -52,6 +87,11 @@ enum OpCode : uint32_t {
 	op_pop,
 	op_return,
 	op_call,
+	op_jz,
+	op_jmp,
+	op_gt,
+	op_lt,
+	op_eq,
 };
 
 enum TokenType {
@@ -72,6 +112,12 @@ enum TokenType {
 	token_colon,
 	token_const,
 	token_return,
+	token_if,
+	token_else,
+	token_then,
+	token_lessthan,
+	token_morethan,
+	token_2equals,
 	token_eof,
 };
 
@@ -99,10 +145,11 @@ struct Token {
 enum ParserPrecedence {
 	prec_none = 0,
 	prec_assignment = 10,
-	prec_arithmetic_addsub = 20,
-	prec_arithmetic_muldiv = 30,
-	prec_left_paren = 40,
-	prec_variable = 50,
+	prec_equality = 20,
+	prec_arithmetic_addsub = 30,
+	prec_arithmetic_muldiv = 40,
+	prec_left_paren = 50,
+	prec_variable = 60,
 };
 
 const std::unordered_map< std::string, Keyword > keyword_list ={
@@ -110,25 +157,36 @@ const std::unordered_map< std::string, Keyword > keyword_list ={
 	{ "Const",		Keyword { "Const",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenType::token_const } },
 	{ "End",		Keyword { "End",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenType::token_end } },
 	{ "Return",		Keyword { "Return",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_return } },
+	{ "If",			Keyword { "If",		Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_if } },
+	{ "Else",		Keyword { "Else",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_else } },
+	{ "Then",		Keyword { "Then",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_then } },
 };
 
-const std::regex rx_operator = std::regex( "([\\(\\)\\+\\-\\*\\/=;:,])" );
+const std::regex rx_double_operator = std::regex( "(==)" );
+const std::regex rx_operator = std::regex( "([\\(\\)\\+\\-\\*\\/=;:,><])" );
 const std::regex rx_identifier_char = std::regex( "[_a-zA-Z0-9]" );
 const std::regex rx_identifier = std::regex( "[_a-zA-Z0-9]+" );
 const std::regex rx_number_char = std::regex( "[.0-9]" );
 const std::regex rx_number = std::regex( "[.0-9]+" );
 
 const std::unordered_map< std::string, Keyword > operator_list = {
-	{ "+", Keyword { "+", Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_plus } },
-	{ "-", Keyword { "-", Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_minus } },
-	{ "/", Keyword { "/", Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_slash } },
-	{ "*", Keyword { "*", Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_star } },
-	{ ";", Keyword { ";", Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_semicolon } },
-	{ "=", Keyword { "=", Keyword::kw_operator, ParserPrecedence::prec_assignment,				TokenType::token_equals } },
-	{ "(", Keyword { "(", Keyword::kw_operator, ParserPrecedence::prec_left_paren,				TokenType::token_paren_left } },
-	{ ")", Keyword { ")", Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_paren_right } },
-	{ ":", Keyword { ":", Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_colon } },
-	{ ",", Keyword { ",", Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_comma } },
+	{ "+",		Keyword { "+",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_plus } },
+	{ "-",		Keyword { "-",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_minus } },
+	{ "/",		Keyword { "/",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_slash } },
+	{ "*",		Keyword { "*",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_star } },
+	{ ";",		Keyword { ";",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_semicolon } },
+	{ "=",		Keyword { "=",		Keyword::kw_operator, ParserPrecedence::prec_assignment,			TokenType::token_equals } },
+	{ "(",		Keyword { "(",		Keyword::kw_operator, ParserPrecedence::prec_left_paren,			TokenType::token_paren_left } },
+	{ ")",		Keyword { ")",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_paren_right } },
+	{ ":",		Keyword { ":",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_colon } },
+	{ ",",		Keyword { ",",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_comma } },
+
+	{ "<",		Keyword { "<",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_lessthan } },
+	{ ">",		Keyword { ">",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_morethan } },
+};
+
+const std::unordered_map< std::string, Keyword > double_char_operator_list ={
+	{ "==",		Keyword{ "==",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_2equals } },
 };
 
 bool scan( const std::string& input, const std::regex& mask, std::string* result ) {
@@ -163,6 +221,13 @@ Token next_token( const std::string_view& input ) {
 
 		if ( is_whitespace )
 			continue;
+
+		if ( std::regex_match( scan_string.substr( 0, 2 ), rx_double_operator ) ) {
+			auto keyword_string = scan_string.substr( 0, 2 );
+			auto keyword = &double_char_operator_list.at( keyword_string );
+
+			return make_token( keyword_string, i + 2, keyword->lbp, keyword->token_type, keyword );
+		}
 
 		if ( std::regex_match( std::string( 1, current_char ), rx_operator ) ) {
 			auto keyword_string = std::string( 1, current_char );
@@ -226,6 +291,16 @@ struct Parser {
 		std::string					name;
 	};
 
+	struct Label {
+		Label( const std::string& label_name ) {
+			name = label_name;
+		}
+
+		std::string					name;
+		int32_t						patch_location;
+		int32_t						target_location;
+	};
+
 	std::vector< Token >						tokens;
 	std::vector< Token >::const_iterator		token_iterator;
 
@@ -243,6 +318,24 @@ void expression( Parser& parser );
 
 void emit( Parser& parser, uint32_t byte ) {
 	parser.functions[ parser.current_function ].code.push_back( byte );
+}
+
+void label_emplace( Parser& parser, Parser::Label& label ) {
+	auto& code = parser.functions[ parser.current_function ].code;
+	label.patch_location = code.size();
+	code.push_back( 0 );
+}
+
+void label_bind( Parser& parser, Parser::Label& label ) {
+	auto& code = parser.functions[ parser.current_function ].code;
+
+	label.target_location = ( uint32_t ) code.size();
+	int32_t offset = label.target_location - ( label.patch_location + 1 );
+
+	encoded_value value;
+	value.data.int32[ 0 ] = offset;
+
+	code[ label.patch_location ] = value.data.uint32[ 0 ];
 }
 
 const Token& advance_token( Parser& parser ) {
@@ -293,7 +386,6 @@ void destroy_scope( Parser& parser ) {
 			parser.stack.erase( parser.stack.begin() + i );
 
 			emit( parser, OpCode::op_pop );
-			printf( "emit op_pop\n" );
 		}
 	}
 
@@ -305,17 +397,11 @@ void create_function( Parser& parser, const std::string& name, FunctionType type
 	create_scope( parser );
 
 	parser.current_function = parser.functions.size() - 1;
-
-	printf( ">> Compiling function: %s\n", name.c_str() );
 }
 
 void finish_function( Parser& parser ) {
 	emit( parser, OpCode::op_load_zero );
 	emit( parser, OpCode::op_return );
-	printf( "emit op_load_zero\n" );
-	printf( "emit op_return\n" );
-
-	printf( "<< Finished function: %s\n", parser.functions[ parser.current_function ].name.c_str() );
 
 	destroy_scope( parser );
 	parser.current_function = 0;
@@ -374,14 +460,12 @@ bool is_finished( Parser& parser ) {
 }
 
 void emit_load_number( Parser& parser, double number ) {
-	uint32_t part0 = encode_double_0( number );
-	uint32_t part1 = encode_double_1( number );
+	encoded_value value;
+	value.data.dbl = number;
 
 	emit( parser, OpCode::op_load_number );
-	emit( parser, part0 );
-	emit( parser, part1 );
-
-	printf( "emit op_load_number: [%x, %x]: %.4f\n", part0, part1, number );
+	emit( parser, value.data.uint32[ 0 ] );
+	emit( parser, value.data.uint32[ 1 ] );
 }
 
 void parse_number( Parser& parser ) {
@@ -397,10 +481,13 @@ void parse_binary( Parser& parser ) {
 	parse_precedence( parser, token.lbp );
 
 	switch ( token.token_type ) {
-	case TokenType::token_plus: emit( parser, OpCode::op_add ); printf( "emit op_add\n" ); break;
-	case TokenType::token_minus: emit( parser, OpCode::op_sub ); printf( "emit op_sub\n" ); break;
-	case TokenType::token_star: emit( parser, OpCode::op_mul ); printf( "emit op_mul\n" ); break;
-	case TokenType::token_slash: emit( parser, OpCode::op_div ); printf( "emit op_div\n" ); break;
+	case TokenType::token_plus: emit( parser, OpCode::op_add ); break;
+	case TokenType::token_minus: emit( parser, OpCode::op_sub );  break;
+	case TokenType::token_star: emit( parser, OpCode::op_mul ); break;
+	case TokenType::token_slash: emit( parser, OpCode::op_div ); break;
+	case TokenType::token_lessthan: emit( parser, OpCode::op_lt ); break;
+	case TokenType::token_morethan: emit( parser, OpCode::op_gt ); break;
+	case TokenType::token_2equals: emit( parser, OpCode::op_eq ); break;
 	default: break;
 	}
 }
@@ -418,12 +505,16 @@ void parse_identifier( Parser& parser ) {
 
 		emit( parser, OpCode::op_load_slot );
 		emit( parser, slot.local_index );
-		printf( "emit op_load_slot [%i]\n", slot.local_index );
 	} else if ( find_function( parser, identifier_token.token_string, &function_index ) ) {
 		// No-op
 	} else {
 		throw std::exception( ( "Identifier '" + identifier_token.token_string + "' not found" ).c_str() );
 	}
+}
+
+void parse_grouping( Parser& parser ) {
+	expression( parser );
+	expect( parser, TokenType::token_paren_right, "Expected ')'" );
 }
 
 void parse_call( Parser& parser ) {
@@ -442,8 +533,6 @@ void parse_call( Parser& parser ) {
 		emit( parser, OpCode::op_call );
 		emit( parser, function_index );
 		emit( parser, 0 );
-
-		printf( "emit op_call [%i, 0]\n", function_index );
 	} else {
 		int arg_count = 0;
 
@@ -456,7 +545,6 @@ void parse_call( Parser& parser ) {
 		emit( parser, function_index );
 		emit( parser, arg_count );
 
-		printf( "emit op_call [%i, %i]\n", function_index, arg_count );
 		expect( parser, TokenType::token_paren_right, "Expected ')' after argument list" );
 	}
 }
@@ -467,6 +555,7 @@ void parse_precedence( Parser& parser, int rbp ) {
 	switch ( current_token->token_type ) {
 	case TokenType::token_number: parse_number( parser ); break;
 	case TokenType::token_identifier: parse_identifier( parser ); break;
+	case TokenType::token_paren_left: parse_grouping( parser ); break;
 	default:
 		throw std::exception( "Expected oneof: token_number, token_identifier" );
 	}
@@ -479,6 +568,9 @@ void parse_precedence( Parser& parser, int rbp ) {
 		case TokenType::token_minus:
 		case TokenType::token_star:
 		case TokenType::token_slash:
+		case TokenType::token_lessthan:
+		case TokenType::token_morethan:
+		case TokenType::token_2equals:
 			parse_binary( parser );
 			break;
 		case TokenType::token_paren_left:
@@ -504,7 +596,6 @@ void const_declaration( Parser& parser ) {
 		expression( parser );
 	} else {
 		emit( parser, OpCode::op_load_zero );
-		printf( "emit op_load_zero\n" );
 	}
 
 	define_variable( parser, slot.slot_index );
@@ -529,7 +620,7 @@ void function_declaration( Parser& parser ) {
 		expect( parser, TokenType::token_colon, "Expected ':' after argument list" );
 	}
 
-	while ( !match( parser, token_end ) ) {
+	while ( !match( parser, TokenType::token_end ) ) {
 		statement( parser );
 	}
 
@@ -541,22 +632,51 @@ void return_statement( Parser& parser ) {
 	if ( match( parser, TokenType::token_semicolon ) ) {
 		emit( parser, OpCode::op_load_zero );
 		emit( parser, OpCode::op_return );
-
-		printf( "emit op_load_zero\n" );
-		printf( "emit op_return\n" );
 	} else {
 		expression( parser );
 
 		emit( parser, OpCode::op_return );
-		printf( "emit op_return\n" );
-
 		expect( parser, TokenType::token_semicolon, "Expected ';' after return value" );
 	}
+}
+
+void if_statement( Parser& parser ) {
+	expression( parser );
+
+	match( parser, TokenType::token_paren_right ); // skip ')'
+
+	expect( parser, TokenType::token_then, "Expected 'Then'" );
+
+	Parser::Label jzLabel( "jz_label" );
+	Parser::Label jmpLabel( "jmpLabel" );
+
+	emit( parser, OpCode::op_jz );
+	label_emplace( parser, jzLabel );
+
+	emit( parser, OpCode::op_pop );
+
+	while ( !match( parser, TokenType::token_end ) ) {
+		statement( parser );
+	}
+
+	emit( parser, OpCode::op_jmp );
+	label_emplace( parser, jmpLabel );
+
+	// Else-branch
+	label_bind( parser, jzLabel );
+	emit( parser, OpCode::op_pop );
+
+	// End If
+	label_bind( parser, jmpLabel );
+
+	expect( parser, TokenType::token_if, "Expected 'If' after 'End'" );
 }
 
 void statement( Parser& parser ) {
 	if ( match( parser, TokenType::token_return ) ) {
 		return_statement( parser );
+	} else if ( match( parser, TokenType::token_if ) ) {
+		if_statement( parser );
 	} else {
 		throw std::exception( ( "Expected statement, got '" + get_current_token( parser ).token_string + "'" ).c_str() );
 	}
@@ -568,7 +688,7 @@ void declaration( Parser& parser ) {
 	}  else if ( match( parser, TokenType::token_function ) ) {
 		function_declaration( parser );
 	} else {
-		statement( parser );
+		throw std::exception( ( "Expected a declaration, got: '" + get_current_token( parser ).token_string + "'" ).c_str() );
 	}
 }
 
@@ -602,12 +722,6 @@ void parse( const std::vector< Token >& tokens, Program* program ) {
 	program->main = std::distance( program->functions.begin(), main_function );
 }
 
-#define arithmetic_op( op ) { \
-	auto b = stack_pop( vm ); \
-	auto a = stack_pop( vm ); \
-	stack_push( vm, a op b ); \
-}
-
 struct VM {
 	struct Frame {
 		const uint32_t*		code;
@@ -631,7 +745,7 @@ double stack_pop( VM& vm ) {
 	return *vm.stack_top;
 }
 
-double stack_push( VM& vm, double value ) {
+void stack_push( VM& vm, double value ) {
 	*vm.stack_top = value;
 	++vm.stack_top;
 
@@ -640,44 +754,62 @@ double stack_push( VM& vm, double value ) {
 	}
 }
 
+#define arit_op( op ) { \
+	auto b = stack_pop( vm ); \
+	auto a = stack_pop( vm ); \
+	stack_push( vm, a op b ); \
+}
+
+#define binary_op( op ) { \
+	auto b = stack_pop( vm ); \
+	auto a = stack_pop( vm ); \
+	stack_push( vm, a op b ? 1.0 : 0.0 ); \
+}
+
 double execute( VM& vm, const Function& fn ) {
 	const uint32_t* code = fn.code.data();
 	double* base = vm.stack;
 
 	for ( const uint32_t* ip = code;; ++ip ) {
 		switch ( *ip ) {
-		case op_add: arithmetic_op( + ); break;
-		case op_sub: arithmetic_op( - ); break;
-		case op_mul: arithmetic_op( * ); break;
-		case op_div: arithmetic_op( / ); break;
-		case op_load_number: {
-			auto part0 = *++ip;
-			auto part1 = *++ip;
+		case OpCode::op_add: arit_op( + ); break;
+		case OpCode::op_sub: arit_op( - ); break;
+		case OpCode::op_mul: arit_op( * ); break;
+		case OpCode::op_div: arit_op( / ); break;
+		case OpCode::op_gt: binary_op( > ); break;
+		case OpCode::op_lt: binary_op( < ); break;
+		case OpCode::op_eq: binary_op( == ); break;
+		case OpCode::op_load_number: {
+			encoded_value value;
+			value.data.uint32[ 0 ] = *++ip;
+			value.data.uint32[ 1 ] = *++ip;
 
-			double result;
-			decode_double( result, part0, part1 );
-
-			stack_push( vm, result );
+			stack_push( vm, value.data.dbl );
 			break;
 		}
-		case op_load_zero: stack_push( vm, 0.0 ); break;
-		case op_load_slot: stack_push( vm, base[ *++ip ] ); break;
-		case op_pop: stack_pop( vm ); break;
-		case op_return: {
+		case OpCode::op_load_zero: stack_push( vm, 0.0 ); break;
+		case OpCode::op_load_slot: stack_push( vm, base[ *++ip ] ); break;
+		case OpCode::op_pop: stack_pop( vm ); break;
+		case OpCode::op_return: {
+			auto return_value = stack_pop( vm );
+
 			if ( vm.frames.size() == 0 ) {
-				return stack_pop( vm );
+				return return_value;
 			}
 			
 			auto& return_frame = vm.frames[ vm.frames.size() - 1 ];
 
+			vm.stack_top = base;
 			base = return_frame.base;
 			code = return_frame.code;
 			ip = return_frame.ip;
 
+			stack_push( vm, return_value );
+
 			vm.frames.pop_back();
 			break;
 		}
-		case op_call: {
+		case OpCode::op_call: {
 			auto function_index = *++ip;
 			auto arg_count = *++ip;
 
@@ -688,6 +820,22 @@ double execute( VM& vm, const Function& fn ) {
 			base = vm.stack_top - arg_count;
 			code = function.code.data();
 			ip = code - 1;
+			break;
+		}
+		case OpCode::op_jz: {
+			encoded_value value;
+			value.data.uint32[ 0 ] = *++ip;
+
+			if ( vm.stack_top[ -1 ] == 0.0 ) {
+				ip += value.data.int32[ 0 ];
+			}
+
+			break;
+		}
+		case OpCode::op_jmp: {
+			encoded_value value;
+			value.data.uint32[ 0 ] = *++ip;
+			ip += value.data.int32[ 0 ];
 			break;
 		}
 		default:
@@ -705,6 +853,11 @@ double run( Program program ) {
 	execute( vm, vm.program.functions[ vm.program.global ] );
 	auto return_value = execute( vm, vm.program.functions[ vm.program.main ] );
 
+	if ( vm.stack != vm.stack_top ) {
+		int32_t stack_offset = ( int32_t ) vm.stack_top - ( int32_t ) vm.stack;
+		std::cout << "Error: there are " << stack_offset << " bytes still active in the stack after exit" << std::endl;
+	}
+
 	delete vm.stack;
 	return return_value;
 }
@@ -717,7 +870,7 @@ int main( int argc, char** argv ) {
 		try {
 			auto tokens = tokenize( input );
 
-			printf( "========== Tokenization ==========\n" );
+			std::cout << "========== Tokenization ==========" << std::endl;
 
 			for ( auto token : tokens ) {
 				std::cout << ( token.keyword ? token.keyword->string : token.token_string ) << std::endl;
@@ -725,25 +878,120 @@ int main( int argc, char** argv ) {
 
 			std::cout << "# of tokens: " << tokens.size() << std::endl;
 
-			printf( "========== Compiler ==========\n" );
+			std::cout << "========== Compiler ==========" << std::endl;
 
 			Program program;
 			parse( tokens, &program );
 
-			std::cout << "# of functions " << program.functions.size() << std::endl;
-			std::cout << "size of code (global scope): " << program.functions[ program.global ].code.size() << std::endl;
-			std::cout << "size of code (Main): " << program.functions[ program.main ].code.size() << std::endl;
+			Disassembly disasm;
+			if ( disassemble( program, &disasm ) ) {
+				print_disassembly( disasm );
+				std::cout << std::endl;
+			} else {
+				std::cout << "Disassembler: invalid bytecode" << std::endl;
+			}
 
-			printf( "========== Execution (VM) ==========\n" );
+			uint32_t globalSize = program.functions[ program.global ].code.size();
+			uint32_t mainSize = program.functions[ program.main ].code.size();
+
+			std::cout << "# of functions " << program.functions.size() << std::endl;
+			std::cout << "size of code (global scope): " << globalSize << " (" << ( globalSize * sizeof( uint32_t ) ) << " bytes)" << std::endl;
+			std::cout << "size of code (Main): " << mainSize << " (" << ( mainSize * sizeof( uint32_t ) ) << " bytes)" << std::endl;
+
+			std::cout << "========== Execution (VM) ==========" << std::endl;
 
 			auto result = run( program );
-			printf( "Return: %f\n", result );
+			std::cout << "Return: " << result << std::endl;
 		} catch ( const std::exception& err ) {
-			printf( "Error: %s\n", err.what() );
+			std::cout << "Error: " << err.what() << std::endl;
 		}
 
-		printf( "========== Done ==========\n" );
+		std::cout << "========== Done ==========" << std::endl;
 	}
 
 	return 0;
+}
+
+bool disassemble( const Program& program, Disassembly* disasm ) {
+	for ( auto fn : program.functions ) {
+		disasm->functions.push_back( Disassembly::Fn{ fn.name, {} } );
+
+		auto& opcodes = disasm->functions[ disasm->functions.size() - 1 ].opcodes;
+
+		for (
+			const uint32_t* ip = fn.code.data();
+			( uint32_t ) ip - ( uint32_t ) fn.code.data() < fn.code.size() * sizeof( uint32_t );
+			++ip
+		) {
+			uint32_t instruction_ip = ( uint32_t ) ip;
+			switch ( *ip ) {
+			case OpCode::op_add: opcodes.push_back( Disassembly::OpCode( 1, "op_add", "" ) ); break;
+			case OpCode::op_sub: opcodes.push_back( Disassembly::OpCode( 1, "op_sub", "" ) ); break;
+			case OpCode::op_mul: opcodes.push_back( Disassembly::OpCode( 1, "op_mul", "" ) ); break;
+			case OpCode::op_div: opcodes.push_back( Disassembly::OpCode( 1, "op_div", "" ) ); break;
+			case OpCode::op_gt: opcodes.push_back( Disassembly::OpCode( 1, "op_gt", "" ) ); break;
+			case OpCode::op_lt: opcodes.push_back( Disassembly::OpCode( 1, "op_lt", "" ) ); break;
+			case OpCode::op_eq: opcodes.push_back( Disassembly::OpCode( 1, "op_eq", "" ) ); break;
+			case OpCode::op_load_number: {
+				encoded_value value;
+				value.data.uint32[ 0 ] = *++ip;
+				value.data.uint32[ 1 ] = *++ip;
+
+				opcodes.push_back( Disassembly::OpCode( 3, "op_load_number", std::to_string( value.data.dbl ) ) );
+				break;
+			}
+			case OpCode::op_load_zero: opcodes.push_back( Disassembly::OpCode( 1, "op_load_zero", "" ) ); break;
+			case OpCode::op_load_slot: {
+				auto slot = *++ip;
+				opcodes.push_back( Disassembly::OpCode( 2, "op_load_slot", std::to_string( slot ) ) );
+				break;
+			}
+			case OpCode::op_pop: opcodes.push_back( Disassembly::OpCode( 1, "op_pop", "" ) ); break;
+			case OpCode::op_return: opcodes.push_back( Disassembly::OpCode( 1, "op_return", "" ) ); break;
+			case OpCode::op_call: {
+				auto function_index = *++ip;
+				auto arg_count = *++ip;
+
+				opcodes.push_back( Disassembly::OpCode( 3, "op_call", std::to_string( function_index ) + ", " + std::to_string( arg_count ) ) );
+				break;
+			}
+			case OpCode::op_jmp:
+			case OpCode::op_jz: {
+				encoded_value value;
+				value.data.uint32[ 0 ] = *++ip;
+
+				uint32_t address = ( uint32_t ) ip + ( value.data.int32[ 0 ] * sizeof( uint32_t ) );
+				uint32_t relative_address = address - ( uint32_t ) fn.code.data() + sizeof( uint32_t );
+
+				opcodes.push_back( Disassembly::OpCode( 2, ip[ -1 ] == OpCode::op_jz ? "op_jz" : "op_jmp",
+					std::to_string( value.data.int32[ 0 ] ) + ", -> " + std::to_string( relative_address ) ) );
+				break;
+			}
+			default:
+				return false;
+			}
+
+			opcodes[ opcodes.size() - 1 ].address = instruction_ip - ( uint32_t ) fn.code.data();
+		}
+	}
+
+	return true;
+}
+
+void print_disassembly ( const Disassembly& disasm ) {
+	for ( auto fn : disasm.functions ) {
+		std::cout << std::endl;
+		std::cout << "Function " << fn.name << ":" << std::endl;
+
+		for ( auto opcode : fn.opcodes ) {
+			std::cout
+				<< std::setfill( '0' ) << std::right << std::setw( 4 )
+				<< opcode.address << " "
+				<< std::setfill( ' ' ) << std::left << std::setw( 30 )
+				<< opcode.name << " "
+				<< std::setfill( ' ' ) << std::setw( 40 )
+				<< ( opcode.args.length() > 0 ? "[" + opcode.args + "]" : "" )
+				<< std::endl;
+		}
+	}
 }
