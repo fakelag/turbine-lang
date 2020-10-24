@@ -36,6 +36,7 @@ struct encoded_value {
 		uint8_t		uint8[ 8 ];
 		uint16_t	uint16[ 4 ];
 		uint32_t	uint32[ 2 ];
+		uint64_t	uint64[ 1 ];
 		int32_t		int32[ 2 ];
 		double		dbl;
 	} data;

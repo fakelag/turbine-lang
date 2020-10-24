@@ -12,6 +12,7 @@
 
 #include "Main.h"
 #include "Whirl/Decompiler.h"
+#include "Whirl/x86_64Compiler.h"
 
 /*
 	Fn FuncName arg0, arg1:
@@ -876,30 +877,6 @@ double run( Program program ) {
 		
 */
 
-typedef double( *JitFn )( );
-JitFn jit_alloc() {
-	unsigned char* memory = ( unsigned char* ) VirtualAllocEx( ( HANDLE ) -1, NULL, 4098, MEM_COMMIT,  PAGE_EXECUTE_READWRITE );
-
-
-	/*
-		movabs rax, 0x3ff0000000000000
-		movq xmm0, rax
-
-		movabs rax, 0x3ff0000000000000
-		movq xmm1, rax
-
-		addsd xmm0, xmm1
-
-		movq rax, xmm0
-		ret
-	*/
-	static const unsigned char code[] ={ 0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0x50, 0x50 };  //{ 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x66, 0x48, 0x0F, 0x6E, 0xC8, 0xF2, 0x0F, 0x58, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0, 0xC3 };
-
-	memcpy( memory, code, sizeof( code ) );
-
-	return ( JitFn ) memory;
-}
-
 std::string read_file( const std::string& path ) {
 	std::string content = "";
 	std::ifstream file_stream;
@@ -967,6 +944,12 @@ int main( int argc, char** argv ) {
 
 			std::vector< AstNode* > ast;
 			jit_decompile( program.functions[ program.main ], &ast );
+
+			JitFunction jit_function;
+			jit_compile( ast, &jit_function );
+
+			//DebugBreak();
+			std::cout << "Jit result: " << jit_function.execute_fn() << std::endl;
 
 			//std::cout << "========== Execution (VM) ==========" << std::endl;
 
