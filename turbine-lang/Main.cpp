@@ -1,10 +1,17 @@
+#define WIN32_LEAN_AND_MEAN
+#include "windows.h"
+
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <regex>
 #include <unordered_map>
 #include <stack>
 #include <iomanip>
+
+#include "Main.h"
+#include "Whirl/Decompiler.h"
 
 /*
 	Fn FuncName arg0, arg1:
@@ -47,54 +54,13 @@ struct Disassembly {
 	std::vector< Fn > functions;
 };
 
-struct encoded_value {
-	union {
-		uint8_t		uint8[ 8 ];
-		uint16_t	uint16[ 4 ];
-		uint32_t	uint32[ 2 ];
-		int32_t		int32[ 2 ];
-		double		dbl;
-	} data;
-};
-
-enum FunctionType {
-	fn_global,
-	fn_main,
-	fn_virtual,
-};
-
-struct Function {
-	std::string								name;
-	std::vector< uint32_t >					code;
-	int										index;
-	FunctionType							type;
-};
-
 struct Program {
 	int										global;
 	int										main;
 	std::vector< Function >					functions;
 };
 
-enum OpCode : uint32_t {
-	op_add,
-	op_sub,
-	op_mul,
-	op_div,
-	op_load_number,
-	op_load_zero,
-	op_load_slot,
-	op_pop,
-	op_return,
-	op_call,
-	op_jz,
-	op_jmp,
-	op_gt,
-	op_lt,
-	op_eq,
-};
-
-enum TokenType {
+enum TokenId {
 	token_identifier,
 	token_number,
 	token_function,
@@ -130,7 +96,7 @@ struct Keyword {
 	std::string		string;
 	KeywordType		type;
 	int				lbp;
-	TokenType		token_type;
+	TokenId			token_type;
 };
 
 struct Token {
@@ -139,7 +105,7 @@ struct Token {
 	bool				is_last;
 	int					parse_distance;
 	int					lbp;
-	TokenType			token_type;
+	TokenId				token_type;
 };
 
 enum ParserPrecedence {
@@ -153,13 +119,13 @@ enum ParserPrecedence {
 };
 
 const std::unordered_map< std::string, Keyword > keyword_list ={
-	{ "Fn",			Keyword { "Fn",		Keyword::kw_word, ParserPrecedence::prec_variable,		TokenType::token_function } },
-	{ "Const",		Keyword { "Const",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenType::token_const } },
-	{ "End",		Keyword { "End",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenType::token_end } },
-	{ "Return",		Keyword { "Return",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_return } },
-	{ "If",			Keyword { "If",		Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_if } },
-	{ "Else",		Keyword { "Else",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_else } },
-	{ "Then",		Keyword { "Then",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenType::token_then } },
+	{ "Fn",			Keyword { "Fn",		Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_function } },
+	{ "Const",		Keyword { "Const",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_const } },
+	{ "End",		Keyword { "End",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_end } },
+	{ "Return",		Keyword { "Return",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_return } },
+	{ "If",			Keyword { "If",		Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_if } },
+	{ "Else",		Keyword { "Else",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_else } },
+	{ "Then",		Keyword { "Then",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_then } },
 };
 
 const std::regex rx_double_operator = std::regex( "(==)" );
@@ -170,23 +136,23 @@ const std::regex rx_number_char = std::regex( "[.0-9]" );
 const std::regex rx_number = std::regex( "[.0-9]+" );
 
 const std::unordered_map< std::string, Keyword > operator_list = {
-	{ "+",		Keyword { "+",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_plus } },
-	{ "-",		Keyword { "-",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenType::token_minus } },
-	{ "/",		Keyword { "/",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_slash } },
-	{ "*",		Keyword { "*",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenType::token_star } },
-	{ ";",		Keyword { ";",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_semicolon } },
-	{ "=",		Keyword { "=",		Keyword::kw_operator, ParserPrecedence::prec_assignment,			TokenType::token_equals } },
-	{ "(",		Keyword { "(",		Keyword::kw_operator, ParserPrecedence::prec_left_paren,			TokenType::token_paren_left } },
-	{ ")",		Keyword { ")",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_paren_right } },
-	{ ":",		Keyword { ":",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_colon } },
-	{ ",",		Keyword { ",",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenType::token_comma } },
+	{ "+",		Keyword { "+",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenId::token_plus } },
+	{ "-",		Keyword { "-",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_addsub,		TokenId::token_minus } },
+	{ "/",		Keyword { "/",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenId::token_slash } },
+	{ "*",		Keyword { "*",		Keyword::kw_operator, ParserPrecedence::prec_arithmetic_muldiv,		TokenId::token_star } },
+	{ ";",		Keyword { ";",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenId::token_semicolon } },
+	{ "=",		Keyword { "=",		Keyword::kw_operator, ParserPrecedence::prec_assignment,			TokenId::token_equals } },
+	{ "(",		Keyword { "(",		Keyword::kw_operator, ParserPrecedence::prec_left_paren,			TokenId::token_paren_left } },
+	{ ")",		Keyword { ")",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenId::token_paren_right } },
+	{ ":",		Keyword { ":",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenId::token_colon } },
+	{ ",",		Keyword { ",",		Keyword::kw_operator, ParserPrecedence::prec_none,					TokenId::token_comma } },
 
-	{ "<",		Keyword { "<",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_lessthan } },
-	{ ">",		Keyword { ">",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_morethan } },
+	{ "<",		Keyword { "<",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenId::token_lessthan } },
+	{ ">",		Keyword { ">",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenId::token_morethan } },
 };
 
 const std::unordered_map< std::string, Keyword > double_char_operator_list ={
-	{ "==",		Keyword{ "==",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenType::token_2equals } },
+	{ "==",		Keyword{ "==",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenId::token_2equals } },
 };
 
 bool scan( const std::string& input, const std::regex& mask, std::string* result ) {
@@ -198,13 +164,13 @@ bool scan( const std::string& input, const std::regex& mask, std::string* result
 }
 
 Token next_token( const std::string_view& input ) {
-	auto make_token = [ &input ]( const std::string& token_string, int parse_dist, int lbp, TokenType type, const Keyword* kw ) -> Token {
+	auto make_token = [ &input ]( const std::string& token_string, int parse_dist, int lbp, TokenId type, const Keyword* kw ) -> Token {
 		Token token;
 
 		token.keyword = kw;
 		token.token_string = token_string;
 		token.parse_distance = parse_dist;
-		token.is_last = token.parse_distance >= ( int ) input.length();
+		token.is_last = false; // token.parse_distance >= ( int ) input.length();
 		token.lbp = lbp;
 		token.token_type = type;
 
@@ -216,8 +182,7 @@ Token next_token( const std::string_view& input ) {
 		std::string scan_string = std::string( input.substr( i ) );
 		std::string token_string;
 
-		bool is_whitespace = ( current_char == '\n' || current_char == ' ' );
-		bool is_last = ( i == input.length() - 1 );
+		bool is_whitespace = ( current_char == '\n' || current_char == ' ' || current_char == '\t' );
 
 		if ( is_whitespace )
 			continue;
@@ -237,7 +202,7 @@ Token next_token( const std::string_view& input ) {
 		}
 
 		if ( std::regex_match( std::string( 1, current_char ), rx_number_char ) && scan( scan_string, rx_number, &token_string ) ) {
-			return make_token( token_string, i + token_string.length(), 0, TokenType::token_number, NULL );
+			return make_token( token_string, i + token_string.length(), 0, TokenId::token_number, NULL );
 		}
 
 		if ( std::regex_match( std::string( 1, current_char ), rx_identifier_char ) && scan( scan_string, rx_identifier, &token_string ) ) {
@@ -247,12 +212,20 @@ Token next_token( const std::string_view& input ) {
 				const Keyword* kw = &found_keyword->second;
 				return make_token( token_string, i + token_string.length(), kw->lbp, kw->token_type, kw );
 			} else {
-				return make_token( token_string, i + token_string.length(), 0, TokenType::token_identifier, NULL );
+				return make_token( token_string, i + token_string.length(), 0, TokenId::token_identifier, NULL );
 			}
 		}
 	}
 
-	throw std::exception( "Parsing past EOF" );
+	Token eofToken;
+	eofToken.keyword = NULL;
+	eofToken.token_string = "";
+	eofToken.parse_distance = input.length();
+	eofToken.is_last = true;
+	eofToken.lbp = 0;
+	eofToken.token_type = TokenId::token_eof;
+
+	return eofToken;
 }
 
 std::vector< Token > tokenize( const std::string& input ) {
@@ -266,17 +239,6 @@ std::vector< Token > tokenize( const std::string& input ) {
 
 		tokens.push_back( last_token );
 	} while ( !last_token.is_last );
-
-	Token eofToken;
-
-	eofToken.keyword = NULL;
-	eofToken.token_string = "";
-	eofToken.parse_distance = input.length();
-	eofToken.is_last = true;
-	eofToken.lbp = 0;
-	eofToken.token_type = TokenType::token_eof;
-
-	tokens.push_back( eofToken );
 
 	return tokens;
 }
@@ -437,7 +399,7 @@ void define_variable( Parser& parser, int slot_index ) {
 	parser.stack[ slot_index ].is_defined = true;
 }
 
-void expect( Parser& parser, TokenType token, const std::string& error ) {
+void expect( Parser& parser, TokenId token, const std::string& error ) {
 	if ( parser.token_iterator->token_type == token ) {
 		advance_token( parser );
 		return;
@@ -446,7 +408,7 @@ void expect( Parser& parser, TokenType token, const std::string& error ) {
 	throw std::exception( error.c_str() );
 }
 
-bool match( Parser& parser, TokenType token ) {
+bool match( Parser& parser, TokenId token ) {
 	if ( parser.token_iterator->token_type == token ) {
 		advance_token( parser );
 		return true;
@@ -481,13 +443,13 @@ void parse_binary( Parser& parser ) {
 	parse_precedence( parser, token.lbp );
 
 	switch ( token.token_type ) {
-	case TokenType::token_plus: emit( parser, OpCode::op_add ); break;
-	case TokenType::token_minus: emit( parser, OpCode::op_sub );  break;
-	case TokenType::token_star: emit( parser, OpCode::op_mul ); break;
-	case TokenType::token_slash: emit( parser, OpCode::op_div ); break;
-	case TokenType::token_lessthan: emit( parser, OpCode::op_lt ); break;
-	case TokenType::token_morethan: emit( parser, OpCode::op_gt ); break;
-	case TokenType::token_2equals: emit( parser, OpCode::op_eq ); break;
+	case TokenId::token_plus: emit( parser, OpCode::op_add ); break;
+	case TokenId::token_minus: emit( parser, OpCode::op_sub );  break;
+	case TokenId::token_star: emit( parser, OpCode::op_mul ); break;
+	case TokenId::token_slash: emit( parser, OpCode::op_div ); break;
+	case TokenId::token_lessthan: emit( parser, OpCode::op_lt ); break;
+	case TokenId::token_morethan: emit( parser, OpCode::op_gt ); break;
+	case TokenId::token_2equals: emit( parser, OpCode::op_eq ); break;
 	default: break;
 	}
 }
@@ -514,13 +476,13 @@ void parse_identifier( Parser& parser ) {
 
 void parse_grouping( Parser& parser ) {
 	expression( parser );
-	expect( parser, TokenType::token_paren_right, "Expected ')'" );
+	expect( parser, TokenId::token_paren_right, "Expected ')'" );
 }
 
 void parse_call( Parser& parser ) {
 	auto identifier_token = get_previous_token( parser, 1 );
 
-	if ( identifier_token.token_type != TokenType::token_identifier ) {
+	if ( identifier_token.token_type != TokenId::token_identifier ) {
 		throw std::exception( ( "Expected an identifier, got '" + identifier_token.token_string + "'" ).c_str() );
 	}
 
@@ -529,7 +491,7 @@ void parse_call( Parser& parser ) {
 		throw std::exception( ( "Identifier '" + identifier_token.token_string + "' not found" ).c_str() );
 	}
 
-	if ( match( parser, TokenType::token_paren_right ) ) {
+	if ( match( parser, TokenId::token_paren_right ) ) {
 		emit( parser, OpCode::op_call );
 		emit( parser, function_index );
 		emit( parser, 0 );
@@ -539,13 +501,13 @@ void parse_call( Parser& parser ) {
 		do {
 			++arg_count;
 			expression( parser );
-		} while ( match( parser, TokenType::token_comma ) );
+		} while ( match( parser, TokenId::token_comma ) );
 
 		emit( parser, OpCode::op_call );
 		emit( parser, function_index );
 		emit( parser, arg_count );
 
-		expect( parser, TokenType::token_paren_right, "Expected ')' after argument list" );
+		expect( parser, TokenId::token_paren_right, "Expected ')' after argument list" );
 	}
 }
 
@@ -553,9 +515,9 @@ void parse_precedence( Parser& parser, int rbp ) {
 	const Token* current_token = &advance_token( parser );
 	
 	switch ( current_token->token_type ) {
-	case TokenType::token_number: parse_number( parser ); break;
-	case TokenType::token_identifier: parse_identifier( parser ); break;
-	case TokenType::token_paren_left: parse_grouping( parser ); break;
+	case TokenId::token_number: parse_number( parser ); break;
+	case TokenId::token_identifier: parse_identifier( parser ); break;
+	case TokenId::token_paren_left: parse_grouping( parser ); break;
 	default:
 		throw std::exception( "Expected oneof: token_number, token_identifier" );
 	}
@@ -564,16 +526,16 @@ void parse_precedence( Parser& parser, int rbp ) {
 		current_token = &advance_token( parser );
 
 		switch ( current_token->token_type ) {
-		case TokenType::token_plus:
-		case TokenType::token_minus:
-		case TokenType::token_star:
-		case TokenType::token_slash:
-		case TokenType::token_lessthan:
-		case TokenType::token_morethan:
-		case TokenType::token_2equals:
+		case TokenId::token_plus:
+		case TokenId::token_minus:
+		case TokenId::token_star:
+		case TokenId::token_slash:
+		case TokenId::token_lessthan:
+		case TokenId::token_morethan:
+		case TokenId::token_2equals:
 			parse_binary( parser );
 			break;
-		case TokenType::token_paren_left:
+		case TokenId::token_paren_left:
 			parse_call( parser );
 			break;
 		default:
@@ -587,75 +549,75 @@ void expression( Parser& parser ) {
 }
 
 void const_declaration( Parser& parser ) {
-	expect( parser, TokenType::token_identifier, "Expected identifier after 'Const'" );
+	expect( parser, TokenId::token_identifier, "Expected identifier after 'Const'" );
 
 	auto identifier_token = get_previous_token( parser );
 	auto& slot = create_variable( parser, identifier_token.token_string );
 
-	if ( match( parser, TokenType::token_equals ) ) {
+	if ( match( parser, TokenId::token_equals ) ) {
 		expression( parser );
 	} else {
 		emit( parser, OpCode::op_load_zero );
 	}
 
 	define_variable( parser, slot.slot_index );
-	expect( parser, TokenType::token_semicolon, "Expected ';' after constant declaration" );
+	expect( parser, TokenId::token_semicolon, "Expected ';' after constant declaration" );
 }
 
 void function_declaration( Parser& parser ) {
-	expect( parser, TokenType::token_identifier, "Expected identifier after 'Fn'" );
+	expect( parser, TokenId::token_identifier, "Expected identifier after 'Fn'" );
 
 	auto identifier_token = get_previous_token( parser );
 	create_function( parser, identifier_token.token_string, FunctionType::fn_virtual );
 
-	if ( !match( parser, TokenType::token_colon ) ) {
+	if ( !match( parser, TokenId::token_colon ) ) {
 		do {
-			expect( parser, TokenType::token_identifier, "Expected identifier or ':'" );
+			expect( parser, TokenId::token_identifier, "Expected identifier or ':'" );
 			auto arg_identifier = get_previous_token( parser );
 
 			auto arg_variable = create_variable( parser, arg_identifier.token_string );
 			define_variable( parser, arg_variable.slot_index );
-		} while ( match( parser, TokenType::token_comma ) );
+		} while ( match( parser, TokenId::token_comma ) );
 
-		expect( parser, TokenType::token_colon, "Expected ':' after argument list" );
+		expect( parser, TokenId::token_colon, "Expected ':' after argument list" );
 	}
 
-	while ( !match( parser, TokenType::token_end ) ) {
+	while ( !match( parser, TokenId::token_end ) ) {
 		statement( parser );
 	}
 
 	finish_function( parser );
-	expect( parser, TokenType::token_function, "Expected 'Fn' after 'End'" );
+	expect( parser, TokenId::token_function, "Expected 'Fn' after 'End'" );
 }
 
 void return_statement( Parser& parser ) {
-	if ( match( parser, TokenType::token_semicolon ) ) {
+	if ( match( parser, TokenId::token_semicolon ) ) {
 		emit( parser, OpCode::op_load_zero );
 		emit( parser, OpCode::op_return );
 	} else {
 		expression( parser );
 
 		emit( parser, OpCode::op_return );
-		expect( parser, TokenType::token_semicolon, "Expected ';' after return value" );
+		expect( parser, TokenId::token_semicolon, "Expected ';' after return value" );
 	}
 }
 
 void if_statement( Parser& parser ) {
 	expression( parser );
 
-	match( parser, TokenType::token_paren_right ); // skip ')'
+	match( parser, TokenId::token_paren_right ); // skip ')'
 
-	expect( parser, TokenType::token_then, "Expected 'Then'" );
+	expect( parser, TokenId::token_then, "Expected 'Then'" );
 
 	Parser::Label jzLabel( "jz_label" );
-	Parser::Label jmpLabel( "jmpLabel" );
+	Parser::Label jmpLabel( "jmp_Label" );
 
 	emit( parser, OpCode::op_jz );
 	label_emplace( parser, jzLabel );
 
 	emit( parser, OpCode::op_pop );
 
-	while ( !match( parser, TokenType::token_end ) ) {
+	while ( !match( parser, TokenId::token_end ) ) {
 		statement( parser );
 	}
 
@@ -669,23 +631,25 @@ void if_statement( Parser& parser ) {
 	// End If
 	label_bind( parser, jmpLabel );
 
-	expect( parser, TokenType::token_if, "Expected 'If' after 'End'" );
+	expect( parser, TokenId::token_if, "Expected 'If' after 'End'" );
 }
 
 void statement( Parser& parser ) {
-	if ( match( parser, TokenType::token_return ) ) {
+	if ( match( parser, TokenId::token_return ) ) {
 		return_statement( parser );
-	} else if ( match( parser, TokenType::token_if ) ) {
+	} else if ( match( parser, TokenId::token_if ) ) {
 		if_statement( parser );
+	} else if ( match( parser, TokenId::token_const ) ) {
+		const_declaration( parser );
 	} else {
 		throw std::exception( ( "Expected statement, got '" + get_current_token( parser ).token_string + "'" ).c_str() );
 	}
 }
 
 void declaration( Parser& parser ) {
-	if ( match( parser, TokenType::token_const ) ) {
+	if ( match( parser, TokenId::token_const ) ) {
 		const_declaration( parser );
-	}  else if ( match( parser, TokenType::token_function ) ) {
+	}  else if ( match( parser, TokenId::token_function ) ) {
 		function_declaration( parser );
 	} else {
 		throw std::exception( ( "Expected a declaration, got: '" + get_current_token( parser ).token_string + "'" ).c_str() );
@@ -862,10 +826,111 @@ double run( Program program ) {
 	return return_value;
 }
 
+// Fn Main: Const x = 1 + 2 + 3 + 4 + 5; End Fn
+/*
+	0000 op_load_number                 [1.000000]
+	0012 op_load_number                 [2.000000]
+	0024 op_add
+	0028 op_load_number                 [3.000000]
+	0040 op_add
+	0044 op_load_number                 [4.000000]
+	0056 op_add
+	0060 op_load_number                 [5.000000]
+	0072 op_add
+
+
+### op_load_number
+		movabs rax, 0x3ff0000000000000
+		movq xmm0, rax
+
+### op_load_number
+		movabs rax, 0x4000000000000000
+		movq xmm1, rax
+
+### op_add
+		addsd xmm0, xmm1		<- could write to both xmm0 and xmm1 as they are consumed from stack in the same inst
+*/
+
+/*
+	op_load_number:
+		emit( "mov rax, " + number_constant );
+		emit( "push rax" );
+
+	op_add:
+		emit( "pop rax" );
+		emit( "movq xmm0" );
+
+		emit( "pop rax" );
+		emit( "movq xmm1" );
+
+		emit( "addsd xmm0, xmm1" );
+		emit( "movq rax, xmm0" );
+		emit( "push rax" );
+
+	op_add (alternative):
+		emit( "movq xmm0,qword ptr ss:[rsp]" );
+		emit( "movq xmm1,qword ptr ss:[rsp+8]" );
+		emit( "addsd xmm0,xmm1" );
+		emit( "movq qword ptr ss:[rsp+8],xmm0" );
+		emit( "add rsp,8" );
+		
+*/
+
+typedef double( *JitFn )( );
+JitFn jit_alloc() {
+	unsigned char* memory = ( unsigned char* ) VirtualAllocEx( ( HANDLE ) -1, NULL, 4098, MEM_COMMIT,  PAGE_EXECUTE_READWRITE );
+
+
+	/*
+		movabs rax, 0x3ff0000000000000
+		movq xmm0, rax
+
+		movabs rax, 0x3ff0000000000000
+		movq xmm1, rax
+
+		addsd xmm0, xmm1
+
+		movq rax, xmm0
+		ret
+	*/
+	static const unsigned char code[] ={ 0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0x50, 0x50 };  //{ 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x66, 0x48, 0x0F, 0x6E, 0xC8, 0xF2, 0x0F, 0x58, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0, 0xC3 };
+
+	memcpy( memory, code, sizeof( code ) );
+
+	return ( JitFn ) memory;
+}
+
+std::string read_file( const std::string& path ) {
+	std::string content = "";
+	std::ifstream file_stream;
+
+	file_stream.open( path );
+
+	if ( file_stream.is_open() )
+	{
+		std::string line;
+		while ( std::getline( file_stream, line ) )
+			content += line + "\n";
+
+		file_stream.close();
+	} else
+	{
+		throw std::exception( "File not found" );
+	}
+
+	return content;
+}
+
 int main( int argc, char** argv ) {
+	//auto fn = jit_alloc();
+	//DebugBreak();
+	//printf( "double= %.2f\n", fn() );
+
+	//VirtualFree( fn, NULL, MEM_FREE );
+
 	while ( true ) {
-		std::string input;
-		std::getline( std::cin, input );
+		std::string input = read_file( "F:\\Projects\\turbine-lang\\test.tb" );
+		//std::getline( std::cin, input );
 
 		try {
 			auto tokens = tokenize( input );
@@ -891,22 +956,26 @@ int main( int argc, char** argv ) {
 				std::cout << "Disassembler: invalid bytecode" << std::endl;
 			}
 
-			uint32_t globalSize = program.functions[ program.global ].code.size();
-			uint32_t mainSize = program.functions[ program.main ].code.size();
+			uint32_t global_size = program.functions[ program.global ].code.size();
+			uint32_t main_size = program.functions[ program.main ].code.size();
 
 			std::cout << "# of functions " << program.functions.size() << std::endl;
-			std::cout << "size of code (global scope): " << globalSize << " (" << ( globalSize * sizeof( uint32_t ) ) << " bytes)" << std::endl;
-			std::cout << "size of code (Main): " << mainSize << " (" << ( mainSize * sizeof( uint32_t ) ) << " bytes)" << std::endl;
+			std::cout << "size of code (global scope): " << global_size << " (" << ( global_size * sizeof( uint32_t ) ) << " bytes)" << std::endl;
+			std::cout << "size of code (Main): " << main_size << " (" << ( main_size * sizeof( uint32_t ) ) << " bytes)" << std::endl;
 
-			std::cout << "========== Execution (VM) ==========" << std::endl;
+			std::cout << "========== Decompilation ==========" << std::endl;
+			jit_decompile( program.functions[ program.main ] );
 
-			auto result = run( program );
-			std::cout << "Return: " << result << std::endl;
+			//std::cout << "========== Execution (VM) ==========" << std::endl;
+
+			//auto result = run( program );
+			//std::cout << "Return: " << result << std::endl;
 		} catch ( const std::exception& err ) {
 			std::cout << "Error: " << err.what() << std::endl;
 		}
 
 		std::cout << "========== Done ==========" << std::endl;
+		break;
 	}
 
 	return 0;
@@ -964,7 +1033,7 @@ bool disassemble( const Program& program, Disassembly* disasm ) {
 				uint32_t relative_address = address - ( uint32_t ) fn.code.data() + sizeof( uint32_t );
 
 				opcodes.push_back( Disassembly::OpCode( 2, ip[ -1 ] == OpCode::op_jz ? "op_jz" : "op_jmp",
-					std::to_string( value.data.int32[ 0 ] ) + ", -> " + std::to_string( relative_address ) ) );
+					std::to_string( value.data.int32[ 0 ] ) ) ); //  +", -> " + std::to_string( relative_address ) ) );
 				break;
 			}
 			default:
