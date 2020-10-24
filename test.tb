@@ -1,0 +1,15 @@
+Fn Main:
+	Const x = 2;
+	If 2 == x Then
+		Const y = x + 1;
+		If y == 4 Then
+			Return 1;
+		End If
+	End If
+	Const z = 0;
+	If 15 == x Then
+		Const xxx = 0;
+		Return 15;
+	End If
+	Return 0;
+End Fn
