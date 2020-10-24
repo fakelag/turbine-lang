@@ -24,12 +24,18 @@
     <ClCompile Include="Whirl\Decompiler.cpp">
       <Filter>Whirl</Filter>
     </ClCompile>
+    <ClCompile Include="Whirl\x86_64Compiler.cpp">
+      <Filter>Whirl</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Main.h">
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="Whirl\Decompiler.h">
+      <Filter>Whirl</Filter>
+    </ClInclude>
+    <ClInclude Include="Whirl\x86_64Compiler.h">
       <Filter>Whirl</Filter>
     </ClInclude>
   </ItemGroup>

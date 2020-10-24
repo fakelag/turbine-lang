@@ -121,10 +121,12 @@
   <ItemGroup>
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Whirl\Decompiler.cpp" />
+    <ClCompile Include="Whirl\x86_64Compiler.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Main.h" />
     <ClInclude Include="Whirl\Decompiler.h" />
+    <ClInclude Include="Whirl\x86_64Compiler.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

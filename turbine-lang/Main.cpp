@@ -964,7 +964,9 @@ int main( int argc, char** argv ) {
 			std::cout << "size of code (Main): " << main_size << " (" << ( main_size * sizeof( uint32_t ) ) << " bytes)" << std::endl;
 
 			std::cout << "========== Decompilation ==========" << std::endl;
-			jit_decompile( program.functions[ program.main ] );
+
+			std::vector< AstNode* > ast;
+			jit_decompile( program.functions[ program.main ], &ast );
 
 			//std::cout << "========== Execution (VM) ==========" << std::endl;
 

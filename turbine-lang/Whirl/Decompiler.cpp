@@ -13,39 +13,6 @@
 #include "Decompiler.h"
 #include "../Main.h"
 
-enum AstNodeType {
-	node_eq,
-	node_div,
-	node_mul,
-	node_sub,
-	node_add,
-	node_const,
-	node_identifier,
-	node_return,
-	node_if,
-};
-
-enum AstNodeGroup {
-	node_simple,
-	node_complex,
-	node_list,
-	node_constant,
-	node_name,
-};
-
-struct AstNode {
-	AstNode() { }
-
-	std::string						node_id;
-	AstNodeType						node_type;
-	AstNodeGroup					node_group;
-
-	std::vector< AstNode* >			children;
-	std::string						var_id_from;
-	std::string						var_id_to;
-	double							constant;
-};
-
 struct StackValue {
 	std::string						var_id;
 	std::string						node_id;
@@ -68,6 +35,47 @@ struct Block {
 	std::vector< uint32_t >			code;
 };
 
+struct NodeAllocator {
+	AstNode* alloc_node() {
+		auto node = new AstNode;
+		allocated_nodes.push_back( node );
+		return node;
+	}
+
+	std::vector< AstNode* > flatten( AstNode* node ) {
+		std::vector< AstNode* > flat_list;
+
+		for ( auto child : node->children ) {
+			auto flat_children = flatten( child );
+			std::copy( flat_children.begin(), flat_children.end(), std::back_inserter( flat_list ) );
+		}
+
+		flat_list.push_back( node );
+
+		return flat_list;
+	}
+
+	void prune( const std::vector< AstNode* >& ast ) {
+		std::unordered_map< uintptr_t, bool > ast_map;
+
+		for ( auto node : ast ) {
+			auto flat_node = flatten( node );
+
+			std::transform( flat_node.begin(), flat_node.end(), std::inserter( ast_map, ast_map.end() ), []( const AstNode* node ) {
+				return std::make_pair( ( uintptr_t ) node, true );
+			} );
+		}
+
+		for ( auto alloc : allocated_nodes ) {
+			if ( ast_map.find( ( uintptr_t ) alloc ) == ast_map.end() ) {
+				delete alloc;
+			}
+		}
+	}
+
+	std::vector< AstNode* >			allocated_nodes;
+};
+
 std::string gen_node_id() {
 	static int s_node_counter = 0;
 	return "node_" + std::to_string( s_node_counter++ );
@@ -83,8 +91,8 @@ std::string gen_var_copy_id( const std::string& original_id ) {
 	return original_id + "_copy_" + std::to_string( s_var_counter++ );
 }
 
-AstNode* alloc_simple_node( const std::string& node_id, AstNodeType node_type, AstNode* child ) {
-	auto node = new AstNode;
+AstNode* alloc_simple_node( NodeAllocator& allocator, const std::string& node_id, AstNodeType node_type, AstNode* child ) {
+	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_simple;
@@ -93,8 +101,9 @@ AstNode* alloc_simple_node( const std::string& node_id, AstNodeType node_type, A
 	return node;
 }
 
-AstNode* alloc_complex_node( const std::string& node_id, AstNodeType node_type, const std::string& var_id_to, AstNode* lhs_child, AstNode* rhs_child ) {
-	auto node = new AstNode;
+AstNode* alloc_complex_node( NodeAllocator& allocator, const std::string& node_id, AstNodeType node_type,
+	const std::string& var_id_to, AstNode* lhs_child, AstNode* rhs_child ) {
+	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_complex;
@@ -104,8 +113,9 @@ AstNode* alloc_complex_node( const std::string& node_id, AstNodeType node_type, 
 	return node;
 }
 
-AstNode* alloc_list_node( const std::string& node_id, AstNodeType node_type, const std::vector< AstNode* >& children ) {
-	auto node = new AstNode;
+AstNode* alloc_list_node( NodeAllocator& allocator, const std::string& node_id,
+	AstNodeType node_type, const std::vector< AstNode* >& children ) {
+	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_list;
@@ -114,8 +124,9 @@ AstNode* alloc_list_node( const std::string& node_id, AstNodeType node_type, con
 	return node;
 }
 
-AstNode* alloc_const_node( const std::string& node_id, AstNodeType node_type, const std::string& var_id_to, double constant ) {
-	auto node = new AstNode;
+AstNode* alloc_const_node( NodeAllocator& allocator, const std::string& node_id,
+	AstNodeType node_type, const std::string& var_id_to, double constant ) {
+	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_constant;
@@ -125,8 +136,9 @@ AstNode* alloc_const_node( const std::string& node_id, AstNodeType node_type, co
 	return node;
 }
 
-AstNode* alloc_identifier_node( const std::string& node_id, const std::string& var_id_from, const std::string& var_id_to ) {
-	auto node = new AstNode;
+AstNode* alloc_identifier_node( NodeAllocator& allocator, const std::string& node_id,
+	const std::string& var_id_from, const std::string& var_id_to ) {
+	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = AstNodeType::node_identifier;
 	node->node_group = AstNodeGroup::node_name;
@@ -170,7 +182,7 @@ void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue 
 	}
 }
 
-void parse_block( const Block& block, std::vector< StackValue >* out_stack, std::vector< AstNode* >* out_nodes ) {
+void parse_block( NodeAllocator& allocator, const Block& block, std::vector< StackValue >* out_stack, std::vector< AstNode* >* out_nodes ) {
 	auto cursor = block.cursor;
 	auto stack = block.stack;
 	auto nodes = block.nodes;
@@ -188,7 +200,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			auto node_id = gen_node_id();
 			auto var_id = gen_var_id();
 
-			nodes.push_back( alloc_const_node( node_id, AstNodeType::node_const, var_id, value.data.dbl ) );
+			nodes.push_back( alloc_const_node( allocator, node_id, AstNodeType::node_const, var_id, value.data.dbl ) );
 			stack.push_back( StackValue{ var_id, node_id } );
 			break;
 		}
@@ -199,7 +211,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			auto node_id = gen_node_id();
 			auto var_id = gen_var_copy_id( current.var_id );
 
-			nodes.push_back( alloc_identifier_node( node_id, current.var_id, var_id ) );
+			nodes.push_back( alloc_identifier_node( allocator, node_id, current.var_id, var_id ) );
 			stack.push_back( StackValue{ var_id, node_id } );
 			break;
 		}
@@ -207,7 +219,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			auto node_id = gen_node_id();
 			auto var_id = gen_var_id();
 
-			nodes.push_back( alloc_const_node( node_id, AstNodeType::node_const, var_id, 0.0 ) );
+			nodes.push_back( alloc_const_node( allocator, node_id, AstNodeType::node_const, var_id, 0.0 ) );
 			stack.push_back( StackValue{ var_id, node_id } );
 			break;
 		}
@@ -235,7 +247,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			default: break;
 			}
 
-			nodes.push_back( alloc_complex_node( node_id, node_type, var_id, left_node, right_node ) );
+			nodes.push_back( alloc_complex_node( allocator, node_id, node_type, var_id, left_node, right_node ) );
 			stack.push_back( StackValue{ var_id, node_id } );
 			break;
 		}
@@ -247,7 +259,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			AstNode* return_value_node = NULL;
 			stack_pop( nodes, stack, NULL, &return_value_node );
 
-			nodes.push_back( alloc_simple_node( gen_node_id(), AstNodeType::node_return, return_value_node ) );
+			nodes.push_back( alloc_simple_node( allocator, gen_node_id(), AstNodeType::node_return, return_value_node ) );
 			break;
 		}
 		case OpCode::op_jmp: {
@@ -278,7 +290,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			std::copy( nodes.begin(), nodes.end(), std::back_inserter( then_block.nodes ) );
 
 			std::vector< AstNode* > then_body_nodes;
-			parse_block( then_block, NULL, &then_body_nodes );
+			parse_block( allocator, then_block, NULL, &then_body_nodes );
 
 			std::vector< AstNode* > then_new_nodes;
 			std::copy_if(
@@ -294,7 +306,7 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 			body_nodes.push_back( *cond_node );
 			std::copy( then_new_nodes.begin(), then_new_nodes.end(), std::back_inserter( body_nodes ) );
 
-			nodes.push_back( alloc_list_node( gen_node_id(), AstNodeType::node_if, body_nodes ) );
+			nodes.push_back( alloc_list_node( allocator, gen_node_id(), AstNodeType::node_if, body_nodes ) );
 
 			cursor += offset;
 
@@ -324,11 +336,11 @@ void parse_block( const Block& block, std::vector< StackValue >* out_stack, std:
 	}
 };
 
-void jit_decompile( const Function& function ) {
-	std::vector< AstNode* > ast;
+void jit_decompile( const Function& function, std::vector< AstNode* >* out_ast ) {
+	NodeAllocator allocator;
 
 	Block block( function.code );
-	parse_block( block, NULL, &ast );
+	parse_block( allocator, block, NULL, out_ast );
 
-	printf( "Ast decompiled, nodes=%zd\n", ast.size() );
+	allocator.prune( *out_ast );
 }
