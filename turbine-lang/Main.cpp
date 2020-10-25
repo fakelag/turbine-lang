@@ -948,8 +948,8 @@ int main( int argc, char** argv ) {
 			JitFunction jit_function;
 			jit_compile( ast, &jit_function );
 
-			//DebugBreak();
-			std::cout << "Jit result: " << jit_function.execute_fn() << std::endl;
+			DebugBreak();
+			std::cout << "Jit result: " << jit_function.fn() << std::endl;
 
 			//std::cout << "========== Execution (VM) ==========" << std::endl;
 

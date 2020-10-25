@@ -3,12 +3,8 @@
 typedef double( *JitExecuteFn )( );
 
 struct JitFunction {
-	unsigned char* base;
-	unsigned char* dst;
-
-	JitExecuteFn execute_fn;
-
-	double constants[ 2 ];
+	JitExecuteFn fn;
+	std::vector< double > constants;
 };
 
 struct AstNode;
