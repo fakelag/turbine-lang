@@ -16,6 +16,8 @@ enum OpCode : uint32_t {
 	op_gt,
 	op_lt,
 	op_eq,
+	op_ne,
+	op_set_slot,
 };
 
 enum FunctionType {

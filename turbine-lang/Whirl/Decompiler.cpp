@@ -97,6 +97,7 @@ AstNode* alloc_simple_node( NodeAllocator& allocator, const std::string& node_id
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_simple;
 	node->children = std::vector< AstNode* >{ child };
+	node->is_statement = false;
 
 	return node;
 }
@@ -109,6 +110,7 @@ AstNode* alloc_complex_node( NodeAllocator& allocator, const std::string& node_i
 	node->node_group = AstNodeGroup::node_complex;
 	node->children = std::vector< AstNode* >{ lhs_child, rhs_child };
 	node->var_id_to = var_id_to;
+	node->is_statement = false;
 
 	return node;
 }
@@ -120,6 +122,7 @@ AstNode* alloc_list_node( NodeAllocator& allocator, const std::string& node_id,
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_list;
 	node->children = children;
+	node->is_statement = false;
 
 	return node;
 }
@@ -132,6 +135,7 @@ AstNode* alloc_const_node( NodeAllocator& allocator, const std::string& node_id,
 	node->node_group = AstNodeGroup::node_constant;
 	node->constant = constant;
 	node->var_id_to = var_id_to;
+	node->is_statement = false;
 
 	return node;
 }
@@ -144,11 +148,24 @@ AstNode* alloc_identifier_node( NodeAllocator& allocator, const std::string& nod
 	node->node_group = AstNodeGroup::node_name;
 	node->var_id_from = var_id_from;
 	node->var_id_to = var_id_to;
+	node->is_statement = false;
 	
 	return node;
 }
 
-AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std::string& node_id ) {
+AstNode* alloc_assign_node( NodeAllocator& allocator, const std::string& node_id, const std::string& var_id_to, AstNode* expr_node ) {
+	auto node = allocator.alloc_node();
+	node->node_id = node_id;
+	node->node_type = AstNodeType::node_assign;
+	node->node_group = AstNodeGroup::node_complex;
+	node->var_id_to = var_id_to;
+	node->children = std::vector< AstNode* >{ expr_node };
+	node->is_statement = true;
+
+	return node;
+}
+
+AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std::string& node_id, bool expressions_only ) {
 	auto find_result = std::find_if( mutable_nodes.begin(), mutable_nodes.end(), [ &node_id ]( const AstNode* node ) {
 		return node->node_id == node_id;
 	} );
@@ -159,8 +176,12 @@ AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std
 
 	auto found_node = *find_result;
 
-	mutable_nodes.erase( find_result );
-	return found_node;
+	if ( found_node->is_statement && expressions_only ) {
+		return NULL;
+	} else {
+		mutable_nodes.erase( find_result );
+		return found_node;
+	}
 }
 
 void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue >& mutable_stack, StackValue* out_value = NULL, AstNode** out_node = NULL ) {
@@ -171,7 +192,7 @@ void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue 
 	auto stack_value = mutable_stack[ mutable_stack.size() - 1 ];
 	mutable_stack.pop_back();
 
-	auto node = find_and_remove_node( mutable_nodes, stack_value.node_id );
+	auto node = find_and_remove_node( mutable_nodes, stack_value.node_id, true );
 
 	if ( out_value ) {
 		*out_value = stack_value;
@@ -182,11 +203,21 @@ void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue 
 	}
 }
 
-void parse_block( NodeAllocator& allocator, const Block& block, std::vector< StackValue >* out_stack, std::vector< AstNode* >* out_nodes ) {
+void parse_block(
+	NodeAllocator& allocator,
+	const Block& block,
+	std::vector< StackValue >* out_stack,
+	std::vector< AstNode* >* out_nodes,
+	bool* out_backjump = NULL
+) {
 	auto cursor = block.cursor;
 	auto stack = block.stack;
 	auto nodes = block.nodes;
 	auto len = block.code.size();
+
+	if ( out_backjump ) {
+		*out_backjump = false;
+	}
 
 	while ( cursor < len ) {
 		auto inst = block.code.at( cursor++ );
@@ -223,6 +254,30 @@ void parse_block( NodeAllocator& allocator, const Block& block, std::vector< Sta
 			stack.push_back( StackValue{ var_id, node_id } );
 			break;
 		}
+		case OpCode::op_set_slot: {
+			auto slot = block.code.at( cursor++ );
+
+			auto& assign_dst = stack[ slot ];
+
+			AstNode* src_node = NULL;
+			StackValue assign_src;
+
+			stack_pop( nodes, stack, &assign_src, &src_node );
+
+			auto node_id = gen_node_id();
+
+			auto node = alloc_assign_node(
+				allocator,
+				node_id,
+				assign_dst.var_id,
+				src_node
+			);
+
+			nodes.push_back( node );
+			stack.push_back( StackValue{ gen_var_id(), node_id } );
+			break;
+		}
+		case OpCode::op_ne:
 		case OpCode::op_eq:
 		case OpCode::op_div:
 		case OpCode::op_mul:
@@ -239,11 +294,12 @@ void parse_block( NodeAllocator& allocator, const Block& block, std::vector< Sta
 
 			AstNodeType node_type;
 			switch ( inst ) {
-			case OpCode::op_eq: node_type = node_eq; break;
-			case OpCode::op_div: node_type = node_div; break;
-			case OpCode::op_mul: node_type = node_mul; break;
-			case OpCode::op_sub: node_type = node_sub; break;
-			case OpCode::op_add: node_type = node_add; break;
+			case OpCode::op_ne: node_type = AstNodeType::node_ne; break;
+			case OpCode::op_eq: node_type = AstNodeType::node_eq; break;
+			case OpCode::op_div: node_type = AstNodeType::node_div; break;
+			case OpCode::op_mul: node_type = AstNodeType::node_mul; break;
+			case OpCode::op_sub: node_type = AstNodeType::node_sub; break;
+			case OpCode::op_add: node_type = AstNodeType::node_add; break;
 			default: break;
 			}
 
@@ -263,12 +319,33 @@ void parse_block( NodeAllocator& allocator, const Block& block, std::vector< Sta
 			break;
 		}
 		case OpCode::op_jmp: {
-			auto offset = block.code.at( cursor++ );
+			int32_t offset = ( int32_t ) block.code.at( cursor++ );
+
+			if ( offset < 0 ) {
+				if ( out_backjump ) {
+					*out_backjump = true;
+				}
+
+				if ( out_stack ) {
+					*out_stack = stack;
+				}
+
+				if ( out_nodes ) {
+					*out_nodes = nodes;
+				}
+
+				return;
+			}
+
 			cursor += offset;
 			break;
 		}
 		case OpCode::op_jz: {
-			auto offset = block.code.at( cursor++ );
+			int32_t offset = ( int32_t ) block.code.at( cursor++ );
+
+			if ( offset < 0 ) {
+				throw std::exception( "Unhandled backwards jump" );
+			}
 
 			// Condition
 			auto cond_node = std::find_if( nodes.begin(), nodes.end(), [ &stack ]( const AstNode* node ) {
@@ -290,7 +367,9 @@ void parse_block( NodeAllocator& allocator, const Block& block, std::vector< Sta
 			std::copy( nodes.begin(), nodes.end(), std::back_inserter( then_block.nodes ) );
 
 			std::vector< AstNode* > then_body_nodes;
-			parse_block( allocator, then_block, NULL, &then_body_nodes );
+
+			bool backjump = false;
+			parse_block( allocator, then_block, NULL, &then_body_nodes, &backjump );
 
 			std::vector< AstNode* > then_new_nodes;
 			std::copy_if(
@@ -306,7 +385,7 @@ void parse_block( NodeAllocator& allocator, const Block& block, std::vector< Sta
 			body_nodes.push_back( *cond_node );
 			std::copy( then_new_nodes.begin(), then_new_nodes.end(), std::back_inserter( body_nodes ) );
 
-			nodes.push_back( alloc_list_node( allocator, gen_node_id(), AstNodeType::node_if, body_nodes ) );
+			nodes.push_back( alloc_list_node( allocator, gen_node_id(), backjump ? AstNodeType::node_while : AstNodeType::node_if, body_nodes ) );
 
 			cursor += offset;
 

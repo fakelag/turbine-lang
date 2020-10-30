@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <stack>
 #include <iomanip>
+#include <chrono>
 
 #include "Main.h"
 #include "Whirl/Decompiler.h"
@@ -78,6 +79,7 @@ enum TokenId {
 	token_comma,
 	token_colon,
 	token_const,
+	token_any,
 	token_return,
 	token_if,
 	token_else,
@@ -85,6 +87,7 @@ enum TokenId {
 	token_lessthan,
 	token_morethan,
 	token_2equals,
+	token_notequals,
 	token_eof,
 };
 
@@ -122,14 +125,16 @@ enum ParserPrecedence {
 const std::unordered_map< std::string, Keyword > keyword_list ={
 	{ "Fn",			Keyword { "Fn",		Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_function } },
 	{ "Const",		Keyword { "Const",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_const } },
+	{ "Any",		Keyword { "Any",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_any } },
 	{ "End",		Keyword { "End",	Keyword::kw_word, ParserPrecedence::prec_variable,		TokenId::token_end } },
 	{ "Return",		Keyword { "Return",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_return } },
 	{ "If",			Keyword { "If",		Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_if } },
 	{ "Else",		Keyword { "Else",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_else } },
 	{ "Then",		Keyword { "Then",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_then } },
+	{ "While",		Keyword { "While",	Keyword::kw_word, ParserPrecedence::prec_none,			TokenId::token_while } },
 };
 
-const std::regex rx_double_operator = std::regex( "(==)" );
+const std::regex rx_double_operator = std::regex( "(==)|(!=)" );
 const std::regex rx_operator = std::regex( "([\\(\\)\\+\\-\\*\\/=;:,><])" );
 const std::regex rx_identifier_char = std::regex( "[_a-zA-Z0-9]" );
 const std::regex rx_identifier = std::regex( "[_a-zA-Z0-9]+" );
@@ -154,6 +159,7 @@ const std::unordered_map< std::string, Keyword > operator_list = {
 
 const std::unordered_map< std::string, Keyword > double_char_operator_list ={
 	{ "==",		Keyword{ "==",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenId::token_2equals } },
+	{ "!=",		Keyword{ "!=",		Keyword::kw_operator, ParserPrecedence::prec_equality,				TokenId::token_notequals } },
 };
 
 bool scan( const std::string& input, const std::regex& mask, std::string* result ) {
@@ -252,6 +258,7 @@ struct Parser {
 		int							slot_index;
 		bool						is_defined;
 		std::string					name;
+		bool						is_const;
 	};
 
 	struct Label {
@@ -291,8 +298,12 @@ void label_emplace( Parser& parser, Parser::Label& label ) {
 
 void label_bind( Parser& parser, Parser::Label& label ) {
 	auto& code = parser.functions[ parser.current_function ].code;
-
 	label.target_location = ( uint32_t ) code.size();
+}
+
+void label_patch( Parser& parser, Parser::Label& label ) {
+	auto& code = parser.functions[ parser.current_function ].code;
+
 	int32_t offset = label.target_location - ( label.patch_location + 1 );
 
 	encoded_value value;
@@ -325,7 +336,7 @@ int get_local_index_for_depth( Parser& parser, int depth = 0 ) {
 	return local_index;
 }
 
-const Parser::Slot& create_variable( Parser& parser, const std::string& name ) {
+const Parser::Slot& create_variable( Parser& parser, const std::string& name, bool is_const ) {
 	parser.stack.push_back(
 		Parser::Slot{
 			parser.stack_depth,
@@ -333,6 +344,7 @@ const Parser::Slot& create_variable( Parser& parser, const std::string& name ) {
 			( int ) parser.stack.size(),
 			false,
 			name,
+			is_const,
 		}
 	);
 
@@ -451,11 +463,38 @@ void parse_binary( Parser& parser ) {
 	case TokenId::token_lessthan: emit( parser, OpCode::op_lt ); break;
 	case TokenId::token_morethan: emit( parser, OpCode::op_gt ); break;
 	case TokenId::token_2equals: emit( parser, OpCode::op_eq ); break;
+	case TokenId::token_notequals: emit( parser, OpCode::op_ne ); break;
 	default: break;
 	}
 }
 
-void parse_identifier( Parser& parser ) {
+void parse_assignment( Parser& parser ) {
+	auto identifier_token = get_previous_token( parser, 1 );
+
+	if ( identifier_token.token_type != TokenId::token_identifier ) {
+		throw std::exception( ( "Expected an identifier, got '" + identifier_token.token_string + "'" ).c_str() );
+	}
+
+	Parser::Slot slot;
+	if ( !find_variable( parser, identifier_token.token_string, &slot ) ) {
+		throw std::exception( ( "Identifier '" + identifier_token.token_string + "' not found" ).c_str() );
+	}
+
+	if ( !slot.is_defined ) {
+		throw std::exception( ( "Can not refer to identifier '" + slot.name + "' before it is initialized" ).c_str() );
+	}
+
+	if ( slot.is_const ) {
+		throw std::exception( ( "Can not reassign constant identifier '" + slot.name + "'" ).c_str() );
+	}
+
+	expression( parser );
+
+	emit( parser, OpCode::op_set_slot );
+	emit( parser, slot.local_index );
+}
+
+void parse_identifier( Parser& parser, bool can_assign ) {
 	auto identifier_token = get_previous_token( parser );
 
 	Parser::Slot slot;
@@ -466,8 +505,12 @@ void parse_identifier( Parser& parser ) {
 			throw std::exception( ( "Can not refer to identifier '" + slot.name + "' before it is initialized" ).c_str() );
 		}
 
-		emit( parser, OpCode::op_load_slot );
-		emit( parser, slot.local_index );
+		if ( can_assign && match( parser, TokenId::token_equals ) ) {
+			parse_assignment( parser );
+		} else {
+			emit( parser, OpCode::op_load_slot );
+			emit( parser, slot.local_index );
+		}
 	} else if ( find_function( parser, identifier_token.token_string, &function_index ) ) {
 		// No-op
 	} else {
@@ -514,10 +557,12 @@ void parse_call( Parser& parser ) {
 
 void parse_precedence( Parser& parser, int rbp ) {
 	const Token* current_token = &advance_token( parser );
+
+	auto can_assign = rbp <= ParserPrecedence::prec_assignment;
 	
 	switch ( current_token->token_type ) {
 	case TokenId::token_number: parse_number( parser ); break;
-	case TokenId::token_identifier: parse_identifier( parser ); break;
+	case TokenId::token_identifier: parse_identifier( parser, can_assign ); break;
 	case TokenId::token_paren_left: parse_grouping( parser ); break;
 	default:
 		throw std::exception( "Expected oneof: token_number, token_identifier" );
@@ -534,6 +579,7 @@ void parse_precedence( Parser& parser, int rbp ) {
 		case TokenId::token_lessthan:
 		case TokenId::token_morethan:
 		case TokenId::token_2equals:
+		case TokenId::token_notequals:
 			parse_binary( parser );
 			break;
 		case TokenId::token_paren_left:
@@ -553,7 +599,7 @@ void const_declaration( Parser& parser ) {
 	expect( parser, TokenId::token_identifier, "Expected identifier after 'Const'" );
 
 	auto identifier_token = get_previous_token( parser );
-	auto& slot = create_variable( parser, identifier_token.token_string );
+	auto& slot = create_variable( parser, identifier_token.token_string, true );
 
 	if ( match( parser, TokenId::token_equals ) ) {
 		expression( parser );
@@ -563,6 +609,22 @@ void const_declaration( Parser& parser ) {
 
 	define_variable( parser, slot.slot_index );
 	expect( parser, TokenId::token_semicolon, "Expected ';' after constant declaration" );
+}
+
+void any_declaration( Parser& parser ) {
+	expect( parser, TokenId::token_identifier, "Expected identifier after 'Any'" );
+
+	auto identifier_token = get_previous_token( parser );
+	auto& slot = create_variable( parser, identifier_token.token_string, false );
+
+	if ( match( parser, TokenId::token_equals ) ) {
+		expression( parser );
+	} else {
+		emit( parser, OpCode::op_load_zero );
+	}
+
+	define_variable( parser, slot.slot_index );
+	expect( parser, TokenId::token_semicolon, "Expected ';' after 'Any' declaration" );
 }
 
 void function_declaration( Parser& parser ) {
@@ -576,7 +638,7 @@ void function_declaration( Parser& parser ) {
 			expect( parser, TokenId::token_identifier, "Expected identifier or ':'" );
 			auto arg_identifier = get_previous_token( parser );
 
-			auto arg_variable = create_variable( parser, arg_identifier.token_string );
+			auto arg_variable = create_variable( parser, arg_identifier.token_string, true );
 			define_variable( parser, arg_variable.slot_index );
 		} while ( match( parser, TokenId::token_comma ) );
 
@@ -627,12 +689,51 @@ void if_statement( Parser& parser ) {
 
 	// Else-branch
 	label_bind( parser, jzLabel );
+	label_patch( parser, jzLabel );
 	emit( parser, OpCode::op_pop );
 
 	// End If
 	label_bind( parser, jmpLabel );
+	label_patch( parser, jmpLabel );
 
 	expect( parser, TokenId::token_if, "Expected 'If' after 'End'" );
+}
+
+void while_statement( Parser& parser ) {
+	Parser::Label jmpLabel( "jmp_label" );
+	Parser::Label jzLabel( "jz_label" );
+	label_bind( parser, jmpLabel );
+
+	expression( parser );
+
+	emit( parser, OpCode::op_jz );
+	label_emplace( parser, jzLabel );
+
+	match( parser, TokenId::token_paren_right ); // skip ')'
+
+	expect( parser, TokenId::token_then, "Expected 'Then'" );
+
+	emit( parser, OpCode::op_pop );
+
+	while ( !match( parser, TokenId::token_end ) ) {
+		statement( parser );
+	}
+
+	emit( parser, OpCode::op_jmp );
+	label_emplace( parser, jmpLabel );
+	label_patch( parser, jmpLabel );
+
+	label_bind( parser, jzLabel );
+	label_patch( parser, jzLabel );
+	emit( parser, OpCode::op_pop );
+
+	expect( parser, TokenId::token_while, "Expected 'While' after 'End'" );
+}
+
+void expression_statement( Parser& parser ) {
+	expression( parser );
+	emit( parser, OpCode::op_pop );
+	expect( parser, TokenId::token_semicolon, "Expected ';' after expression" );
 }
 
 void statement( Parser& parser ) {
@@ -640,10 +741,14 @@ void statement( Parser& parser ) {
 		return_statement( parser );
 	} else if ( match( parser, TokenId::token_if ) ) {
 		if_statement( parser );
+	}  else if ( match( parser, TokenId::token_while ) ) {
+		while_statement( parser );
 	} else if ( match( parser, TokenId::token_const ) ) {
 		const_declaration( parser );
+	} else if ( match( parser, TokenId::token_any ) ) {
+		any_declaration( parser );
 	} else {
-		throw std::exception( ( "Expected statement, got '" + get_current_token( parser ).token_string + "'" ).c_str() );
+		expression_statement( parser );
 	}
 }
 
@@ -744,6 +849,7 @@ double execute( VM& vm, const Function& fn ) {
 		case OpCode::op_gt: binary_op( > ); break;
 		case OpCode::op_lt: binary_op( < ); break;
 		case OpCode::op_eq: binary_op( == ); break;
+		case OpCode::op_ne: binary_op( != ); break;
 		case OpCode::op_load_number: {
 			encoded_value value;
 			value.data.uint32[ 0 ] = *++ip;
@@ -754,6 +860,7 @@ double execute( VM& vm, const Function& fn ) {
 		}
 		case OpCode::op_load_zero: stack_push( vm, 0.0 ); break;
 		case OpCode::op_load_slot: stack_push( vm, base[ *++ip ] ); break;
+		case OpCode::op_set_slot: base[ *++ip ] = vm.stack_top[ -1 ]; break;
 		case OpCode::op_pop: stack_pop( vm ); break;
 		case OpCode::op_return: {
 			auto return_value = stack_pop( vm );
@@ -816,7 +923,13 @@ double run( Program program ) {
 	vm.stack_top = &vm.stack[ 0 ];
 
 	execute( vm, vm.program.functions[ vm.program.global ] );
+
+	auto time_start = std::chrono::steady_clock::now();
 	auto return_value = execute( vm, vm.program.functions[ vm.program.main ] );
+	auto time_end = std::chrono::steady_clock::now();
+
+	auto d_s = std::chrono::duration_cast< std::chrono::milliseconds >( time_end - time_start );
+	std::cout << "Interpreter took " << d_s.count() << " ms" << std::endl;
 
 	if ( vm.stack != vm.stack_top ) {
 		int32_t stack_offset = ( int32_t ) vm.stack_top - ( int32_t ) vm.stack;
@@ -826,56 +939,6 @@ double run( Program program ) {
 	delete vm.stack;
 	return return_value;
 }
-
-// Fn Main: Const x = 1 + 2 + 3 + 4 + 5; End Fn
-/*
-	0000 op_load_number                 [1.000000]
-	0012 op_load_number                 [2.000000]
-	0024 op_add
-	0028 op_load_number                 [3.000000]
-	0040 op_add
-	0044 op_load_number                 [4.000000]
-	0056 op_add
-	0060 op_load_number                 [5.000000]
-	0072 op_add
-
-
-### op_load_number
-		movabs rax, 0x3ff0000000000000
-		movq xmm0, rax
-
-### op_load_number
-		movabs rax, 0x4000000000000000
-		movq xmm1, rax
-
-### op_add
-		addsd xmm0, xmm1		<- could write to both xmm0 and xmm1 as they are consumed from stack in the same inst
-*/
-
-/*
-	op_load_number:
-		emit( "mov rax, " + number_constant );
-		emit( "push rax" );
-
-	op_add:
-		emit( "pop rax" );
-		emit( "movq xmm0" );
-
-		emit( "pop rax" );
-		emit( "movq xmm1" );
-
-		emit( "addsd xmm0, xmm1" );
-		emit( "movq rax, xmm0" );
-		emit( "push rax" );
-
-	op_add (alternative):
-		emit( "movq xmm0,qword ptr ss:[rsp]" );
-		emit( "movq xmm1,qword ptr ss:[rsp+8]" );
-		emit( "addsd xmm0,xmm1" );
-		emit( "movq qword ptr ss:[rsp+8],xmm0" );
-		emit( "add rsp,8" );
-		
-*/
 
 std::string read_file( const std::string& path ) {
 	std::string content = "";
@@ -899,12 +962,6 @@ std::string read_file( const std::string& path ) {
 }
 
 int main( int argc, char** argv ) {
-	//auto fn = jit_alloc();
-	//DebugBreak();
-	//printf( "double= %.2f\n", fn() );
-
-	//VirtualFree( fn, NULL, MEM_FREE );
-
 	while ( true ) {
 		std::string input = read_file( "F:\\Projects\\turbine-lang\\test.tb" );
 		//std::getline( std::cin, input );
@@ -948,13 +1005,17 @@ int main( int argc, char** argv ) {
 			JitFunction jit_function;
 			jit_compile( ast, &jit_function );
 
-			DebugBreak();
+			auto time_start = std::chrono::steady_clock::now();
 			std::cout << "Jit result: " << jit_function.fn() << std::endl;
+			auto time_end = std::chrono::steady_clock::now();
 
-			//std::cout << "========== Execution (VM) ==========" << std::endl;
+			auto d_s = std::chrono::duration_cast< std::chrono::milliseconds >( time_end - time_start );
+			std::cout << "JIT took " << d_s.count() << " ms" << std::endl;
 
-			//auto result = run( program );
-			//std::cout << "Return: " << result << std::endl;
+			std::cout << "========== Execution (VM) ==========" << std::endl;
+
+			auto result = run( program );
+			std::cout << "Return: " << result << std::endl;
 		} catch ( const std::exception& err ) {
 			std::cout << "Error: " << err.what() << std::endl;
 		}
@@ -963,6 +1024,7 @@ int main( int argc, char** argv ) {
 		break;
 	}
 
+	std::getchar();
 	return 0;
 }
 
@@ -986,6 +1048,7 @@ bool disassemble( const Program& program, Disassembly* disasm ) {
 			case OpCode::op_gt: opcodes.push_back( Disassembly::OpCode( 1, "op_gt", "" ) ); break;
 			case OpCode::op_lt: opcodes.push_back( Disassembly::OpCode( 1, "op_lt", "" ) ); break;
 			case OpCode::op_eq: opcodes.push_back( Disassembly::OpCode( 1, "op_eq", "" ) ); break;
+			case OpCode::op_ne: opcodes.push_back( Disassembly::OpCode( 1, "op_ne", "" ) ); break;
 			case OpCode::op_load_number: {
 				encoded_value value;
 				value.data.uint32[ 0 ] = *++ip;
@@ -998,6 +1061,11 @@ bool disassemble( const Program& program, Disassembly* disasm ) {
 			case OpCode::op_load_slot: {
 				auto slot = *++ip;
 				opcodes.push_back( Disassembly::OpCode( 2, "op_load_slot", std::to_string( slot ) ) );
+				break;
+			}
+			case OpCode::op_set_slot: {
+				auto slot_index = *++ip;
+				opcodes.push_back( Disassembly::OpCode( 2, "op_set_slot", std::to_string( slot_index ) ) );
 				break;
 			}
 			case OpCode::op_pop: opcodes.push_back( Disassembly::OpCode( 1, "op_pop", "" ) ); break;

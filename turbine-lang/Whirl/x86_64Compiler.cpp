@@ -83,16 +83,21 @@ void asm_mov_reg_xmm( JitContext* context, unsigned char dst, unsigned char xmm_
 void asm_mov_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
 void asm_add_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
 void asm_sub_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
+void asm_mul_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
+void asm_div_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
 void asm_mov_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
 void asm_sub_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
 void asm_add_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
-//void asm_mul_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
-//void asm_div_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
+void asm_mul_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
+void asm_div_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index );
 void asm_xor_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src );
 void asm_ucomisd_xmm_xmm( JitContext* context, unsigned char xmm_a, unsigned char xmm_b );
 void asm_ucomisd_xmm_const( JitContext* context, unsigned char xmm, uint8_t constant_index );
+void asm_pxor_xmm( JitContext* context, unsigned char xmm_dst, unsigned char xmm_src );
 void asm_jmp_rel32( JitContext* context, uint32_t rel32 );
 void asm_jz_rel32( JitContext* context, uint32_t rel32 );
+void asm_jmp_rel8( JitContext* context, uint8_t rel8 );
+void asm_jz_rel8( JitContext* context, uint8_t rel8 );
 void asm_ret( JitContext* context );
 
 struct Label {
@@ -112,7 +117,43 @@ struct Label {
 
 	std::string name;
 	unsigned char* location;
+	unsigned char* target;
 };
+
+void label_target( JitContext* context, Label* label ) {
+	label->target = context->dst;
+}
+
+void label_emplace( JitContext* context, Label* label, uint32_t back_offset = 0x4 ) {
+	label->location = context->dst - back_offset;
+}
+
+void label_patch_long( JitContext* context, Label* label ) {
+	int32_t relative_addr = ( int32_t ) ( label->target - ( label->location + 0x4 ) );
+
+	encoded_value value;
+	value.data.int32[ 0 ] = relative_addr;
+
+	asm_write_bytes( label->location, 0x4,
+		value.data.uint8[ 0 ],
+		value.data.uint8[ 1 ],
+		value.data.uint8[ 2 ],
+		value.data.uint8[ 3 ]
+	);
+}
+
+void label_patch_byte( JitContext* context, Label* label ) {
+	int32_t relative_addr = ( int32_t ) ( label->target - ( label->location + 0x1 ) );
+
+	bool is_positive_byte = relative_addr <= 0x7F && relative_addr > 0;
+	bool is_negative_byte = relative_addr <= -127 && relative_addr < 0;
+
+	if ( is_positive_byte || is_negative_byte ) {
+		asm_write_bytes( label->location, 0x1, ( int8_t ) relative_addr );
+	} else {
+		throw std::exception( "Invalid patch range" );
+	}
+}
 
 void create_identifier( JitContext* context, uint32_t xmm_location, const std::string& name ) {
 	context->identifiers.emplace_back( name, LocationType::location_xmm, xmm_location, context->hydrate_count, false, 0 );
@@ -225,6 +266,36 @@ int32_t jit_alloc_xmm( JitContext* context ) {
 	}
 }
 
+bool find_foldable_const_identifier( JitContext* context, AstNode* node, uint32_t* out_const_node, uint32_t* out_const_index ) {
+	if ( node->node_type == AstNodeType::node_eq || node->node_type == AstNodeType::node_ne ) {
+		return false;
+	}
+
+	int node_index = node->node_type == AstNodeType::node_sub || node->node_type == AstNodeType::node_div
+		? 1
+		: 0;
+
+	for ( ; node_index < 2; ++node_index ) {
+		auto child = node->children[ node_index ];
+
+		if ( child->node_type != AstNodeType::node_const ) {
+			continue;
+		}
+
+		uint32_t constant_index = jit_add_constant( context, child->constant );
+
+		if ( find_identifier_constant_in_xmm( context, constant_index ) == NULL ) {
+			// Constant is loaded in the table but is not present in a register
+			// Use a direct constant operation
+			*out_const_node = node_index;
+			*out_const_index = constant_index;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void hydrate_identifier( JitContext* context, Identifier* identifier ) {
 	if ( identifier->location_type == LocationType::location_stack ) {
 		auto xmm = jit_alloc_xmm( context );
@@ -267,30 +338,15 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 		create_identifier( context, xmm, node->var_id_to );
 		break;
 	}
+	case AstNodeType::node_ne:
+	case AstNodeType::node_eq:
+	case AstNodeType::node_div:
+	case AstNodeType::node_mul:
 	case AstNodeType::node_sub:
 	case AstNodeType::node_add: {
-		int constant_node = -1;
-		uint32_t const_index = -1;
-		for ( uint32_t i = 0; i < 2; ++i ) {
-			auto child = node->children[ i ];
-
-			if ( child->node_type != AstNodeType::node_const ) {
-				continue;
-			}
-
-			uint32_t constant_index = jit_add_constant( context, child->constant );
-
-			if ( find_identifier_constant_in_xmm( context, constant_index ) == NULL ) {
-				// Constant is loaded in the table but is not present in a register
-				// Use a direct constant operation
-				constant_node = i;
-				const_index = constant_index;
-				break;
-			}
-		}
-
-		if ( constant_node != -1 ) {
-			int other_node = 1 - constant_node;
+		uint32_t const_node, const_index;
+		if ( find_foldable_const_identifier( context, node, &const_node, &const_index ) ) {
+			int other_node = 1 - const_node;
 
 			jit_recursive( context, node->children[ other_node ] );
 
@@ -304,6 +360,8 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 			switch ( node->node_type ) {
 			case AstNodeType::node_add: asm_add_xmm_const( context, target_xmm, const_index ); break;
 			case AstNodeType::node_sub: asm_sub_xmm_const( context, target_xmm, const_index ); break;
+			case AstNodeType::node_mul: asm_mul_xmm_const( context, target_xmm, const_index ); break;
+			case AstNodeType::node_div: asm_div_xmm_const( context, target_xmm, const_index ); break;
 			default: break;
 			}
 
@@ -325,8 +383,44 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 			auto target_xmm = left_identifier->location;
 
 			switch ( node->node_type ) {
+			case AstNodeType::node_ne:
+			case AstNodeType::node_eq: {
+				Label jz_label;
+				Label jmp_label;
+
+				auto one_constant = jit_add_constant( context, 1.0 );
+
+				asm_ucomisd_xmm_xmm( context, left_identifier->location, right_identifier->location );
+
+				asm_jz_rel8( context, 0xFF );
+				label_emplace( context, &jz_label, 0x1 );
+				
+				if ( node->node_type == AstNodeType::node_eq ) {
+					asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
+				} else {
+					asm_mov_xmm_const( context, target_xmm, one_constant );
+				}
+
+				asm_jmp_rel8( context, 0xFF );
+				label_emplace( context, &jmp_label, 0x1 );
+
+				label_target( context, &jz_label );
+				label_patch_byte( context, &jz_label );
+
+				if ( node->node_type == AstNodeType::node_eq ) {
+					asm_mov_xmm_const( context, target_xmm, one_constant );
+				} else {
+					asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
+				}
+
+				label_target( context, &jmp_label );
+				label_patch_byte( context, &jmp_label );
+				break;
+			}
 			case AstNodeType::node_add: asm_add_xmm_xmm( context, target_xmm, right_identifier->location ); break;
 			case AstNodeType::node_sub: asm_sub_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+			case AstNodeType::node_mul: asm_mul_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+			case AstNodeType::node_div: asm_div_xmm_xmm( context, target_xmm, right_identifier->location ); break;
 			default: break;
 			}
 
@@ -367,7 +461,7 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 
 		asm_ucomisd_xmm_const( context, identifier->location, zero_constant );
 		asm_jz_rel32( context, 0x7FFFFFFF );
-		jz_label.location = context->dst - 0x4;
+		label_emplace( context, &jz_label );
 
 		remove_identifier_by_name( context, node->children[ 0 ]->var_id_to );
 
@@ -375,18 +469,62 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 			jit_recursive( context, node->children[ i ] );
 		}
 
-		uint32_t relative_addr = ( uint32_t ) ( context->dst - ( jz_label.location + 0x4 ) );
+		label_target( context, &jz_label );
+		label_patch_long( context, &jz_label );
+		break;
+	}
+	case AstNodeType::node_while: {
+		Label jz_label;
+		Label jmp_label;
 
-		encoded_value value;
-		value.data.uint32[ 0 ] = relative_addr;
+		label_target( context, &jmp_label );
+		jit_recursive( context, node->children[ 0 ] );
 
-		asm_write_bytes( jz_label.location, 0x4,
-			value.data.uint8[ 0 ],
-			value.data.uint8[ 1 ],
-			value.data.uint8[ 2 ],
-			value.data.uint8[ 3 ]
-		);
+		auto identifier = find_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+		hydrate_identifier( context, identifier );
 
+		assert( identifier->location_type == LocationType::location_xmm );
+
+		auto zero_constant = jit_add_constant( context, 0.0 );
+
+		asm_ucomisd_xmm_const( context, identifier->location, zero_constant );
+		asm_jz_rel32( context, 0x7FFFFFFF );
+		label_emplace( context, &jz_label );
+
+		remove_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+
+		for ( size_t i = 1; i < node->children.size(); ++i ) {
+			jit_recursive( context, node->children[ i ] );
+		}
+
+		asm_jmp_rel32( context, 0x7FFFFFFF );
+		label_emplace( context, &jmp_label );
+		label_patch_long( context, &jmp_label );
+
+		label_target( context, &jz_label );
+		label_patch_long( context, &jz_label );
+		break;
+	}
+	case AstNodeType::node_assign: {
+		jit_recursive( context, node->children[ 0 ] );
+
+		auto identifier_src = find_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+		auto identifier_dst = find_identifier_by_name( context, node->var_id_to );
+
+		if ( identifier_src->is_constant ) {
+			throw std::exception( "Cant assign to a constant" );
+		}
+
+		// TODO optimization: can get rid of hydrates here by assigning directly to stack
+		hydrate_identifier( context, identifier_src );
+		hydrate_identifier( context, identifier_dst );
+
+		assert( identifier_src->location_type == LocationType::location_xmm );
+		assert( identifier_dst->location_type == LocationType::location_xmm );
+
+		asm_mov_xmm_xmm( context, identifier_dst->location, identifier_src->location );
+
+		// CAN SRC IDENTIFIER BE REMOVED????
 		break;
 	}
 	default:
@@ -597,6 +735,16 @@ void asm_sub_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char
 	context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x5C, 0xC0 | ( xmm_dest << 3 ) | xmm_src );
 }
 
+void asm_mul_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src ) {
+	// mulsd <xmm>, <xmm>
+	context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x59, 0xC0 | ( xmm_dest << 3 ) | xmm_src );
+}
+
+void asm_div_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src ) {
+	// divsd <xmm>, <xmm>
+	context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x5E, 0xC0 | ( xmm_dest << 3 ) | xmm_src );
+}
+
 void asm_mov_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index ) {
 	// movsd  <xmm>, QWORD PTR [REG_CONST_TABLE+constant_index]
 	if ( constant_index == 0 ) {
@@ -624,23 +772,23 @@ void asm_add_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t con
 	}
 }
 
-//void asm_mul_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index ) {
-//	// mulsd  <xmm>, QWORD PTR [REG_CONST_TABLE+constant_index]
-//	if ( constant_index == 0 ) {
-//		context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x59, 0x00 | ( xmm_dest << 3 ) | REG_CONST_TABLE );
-//	} else {
-//		context->dst = asm_write_bytes( context->dst, 5, 0xF2, 0x0F, 0x59, 0x40 | ( xmm_dest << 3 ) | REG_CONST_TABLE, constant_index * sizeof( double ) );
-//	}
-//}
-//
-//void asm_div_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index ) {
-//	// divsd  <xmm>, QWORD PTR [REG_CONST_TABLE+constant_index]
-//	if ( constant_index == 0 ) {
-//		context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x5E, 0x00 | ( xmm_dest << 3 ) | REG_CONST_TABLE );
-//	} else {
-//		context->dst = asm_write_bytes( context->dst, 5, 0xF2, 0x0F, 0x5E, 0x40 | ( xmm_dest << 3 ) | REG_CONST_TABLE, constant_index * sizeof( double ) );
-//	}
-//}
+void asm_mul_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index ) {
+	// mulsd  <xmm>, QWORD PTR [REG_CONST_TABLE+constant_index]
+	if ( constant_index == 0 ) {
+		context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x59, 0x00 | ( xmm_dest << 3 ) | REG_CONST_TABLE );
+	} else {
+		context->dst = asm_write_bytes( context->dst, 5, 0xF2, 0x0F, 0x59, 0x40 | ( xmm_dest << 3 ) | REG_CONST_TABLE, constant_index * sizeof( double ) );
+	}
+}
+
+void asm_div_xmm_const( JitContext* context, unsigned char xmm_dest, uint8_t constant_index ) {
+	// divsd  <xmm>, QWORD PTR [REG_CONST_TABLE+constant_index]
+	if ( constant_index == 0 ) {
+		context->dst = asm_write_bytes( context->dst, 4, 0xF2, 0x0F, 0x5E, 0x00 | ( xmm_dest << 3 ) | REG_CONST_TABLE );
+	} else {
+		context->dst = asm_write_bytes( context->dst, 5, 0xF2, 0x0F, 0x5E, 0x40 | ( xmm_dest << 3 ) | REG_CONST_TABLE, constant_index * sizeof( double ) );
+	}
+}
 
 void asm_xor_xmm_xmm( JitContext* context, unsigned char xmm_dest, unsigned char xmm_src ) {
 	context->dst = asm_write_bytes( context->dst, 4, 0x66, 0x0F, 0xEF, 0xC0 | ( xmm_dest << 3 ) | xmm_src );
@@ -656,6 +804,11 @@ void asm_ucomisd_xmm_const( JitContext* context, unsigned char xmm, uint8_t cons
 	} else {
 		context->dst = asm_write_bytes( context->dst, 5, 0x66, 0x0F, 0x2E, 0x40 | ( xmm << 3 ) | REG_CONST_TABLE, constant_index * sizeof( double ) );
 	}
+}
+
+void asm_pxor_xmm( JitContext* context, unsigned char xmm_dst, unsigned char xmm_src ) {
+	// pxor <xmm>, <xmm>
+	context->dst = asm_write_bytes( context->dst, 4, 0x66, 0x0F, 0xEF, 0xC0 | ( xmm_dst << 3 ) | xmm_src );
 }
 
 void asm_jmp_rel32( JitContext* context, uint32_t rel32 ) {
@@ -682,6 +835,14 @@ void asm_jz_rel32( JitContext* context, uint32_t rel32 ) {
 		value.data.uint8[ 2 ],
 		value.data.uint8[ 3 ]
 	);
+}
+
+void asm_jmp_rel8( JitContext* context, uint8_t rel8 ) {
+	context->dst = asm_write_bytes( context->dst, 2, 0xEB, rel8 );
+}
+
+void asm_jz_rel8( JitContext* context, uint8_t rel8 ) {
+	context->dst = asm_write_bytes( context->dst, 2, 0x74, rel8 );
 }
 
 void asm_ret( JitContext* context ) {
