@@ -254,7 +254,6 @@ std::vector< Token > tokenize( const std::string& input ) {
 struct Parser {
 	struct Slot {
 		int							depth;
-		int							local_index;
 		int							slot_index;
 		bool						is_defined;
 		std::string					name;
@@ -324,23 +323,10 @@ const Token& get_previous_token( Parser& parser, int offset = 0 ) {
 	return *( parser.token_iterator - 1 - offset );
 }
 
-int get_local_index_for_depth( Parser& parser, int depth = 0 ) {
-	int local_index = -1;
-	for ( auto it = parser.stack.rbegin(); it != parser.stack.rend(); ++it ) {
-		if ( it->depth == depth ) {
-			local_index = it->local_index;
-			break;
-		}
-	}
-
-	return local_index;
-}
-
 const Parser::Slot& create_variable( Parser& parser, const std::string& name, bool is_const ) {
 	parser.stack.push_back(
 		Parser::Slot{
 			parser.stack_depth,
-			get_local_index_for_depth( parser, parser.stack_depth ) + 1,
 			( int ) parser.stack.size(),
 			false,
 			name,
@@ -491,7 +477,7 @@ void parse_assignment( Parser& parser ) {
 	expression( parser );
 
 	emit( parser, OpCode::op_set_slot );
-	emit( parser, slot.local_index );
+	emit( parser, slot.slot_index );
 }
 
 void parse_identifier( Parser& parser, bool can_assign ) {
@@ -509,7 +495,7 @@ void parse_identifier( Parser& parser, bool can_assign ) {
 			parse_assignment( parser );
 		} else {
 			emit( parser, OpCode::op_load_slot );
-			emit( parser, slot.local_index );
+			emit( parser, slot.slot_index );
 		}
 	} else if ( find_function( parser, identifier_token.token_string, &function_index ) ) {
 		// No-op
@@ -680,9 +666,13 @@ void if_statement( Parser& parser ) {
 
 	emit( parser, OpCode::op_pop );
 
+	create_scope( parser );
+
 	while ( !match( parser, TokenId::token_end ) ) {
 		statement( parser );
 	}
+
+	destroy_scope( parser );
 
 	emit( parser, OpCode::op_jmp );
 	label_emplace( parser, jmpLabel );
@@ -715,9 +705,13 @@ void while_statement( Parser& parser ) {
 
 	emit( parser, OpCode::op_pop );
 
+	create_scope( parser );
+
 	while ( !match( parser, TokenId::token_end ) ) {
 		statement( parser );
 	}
+
+	destroy_scope( parser );
 
 	emit( parser, OpCode::op_jmp );
 	label_emplace( parser, jmpLabel );
@@ -931,11 +925,6 @@ double run( Program program ) {
 	auto d_s = std::chrono::duration_cast< std::chrono::milliseconds >( time_end - time_start );
 	std::cout << "Interpreter took " << d_s.count() << " ms" << std::endl;
 
-	if ( vm.stack != vm.stack_top ) {
-		int32_t stack_offset = ( int32_t ) vm.stack_top - ( int32_t ) vm.stack;
-		std::cout << "Error: there are " << stack_offset << " bytes still active in the stack after exit" << std::endl;
-	}
-
 	delete vm.stack;
 	return return_value;
 }
@@ -1006,9 +995,9 @@ int main( int argc, char** argv ) {
 			jit_compile( ast, &jit_function );
 
 			auto time_start = std::chrono::steady_clock::now();
+			DebugBreak();
 			std::cout << "Jit result: " << jit_function.fn() << std::endl;
 			auto time_end = std::chrono::steady_clock::now();
-
 			auto d_s = std::chrono::duration_cast< std::chrono::milliseconds >( time_end - time_start );
 			std::cout << "JIT took " << d_s.count() << " ms" << std::endl;
 
@@ -1086,7 +1075,7 @@ bool disassemble( const Program& program, Disassembly* disasm ) {
 				uint32_t relative_address = address - ( uint32_t ) fn.code.data() + sizeof( uint32_t );
 
 				opcodes.push_back( Disassembly::OpCode( 2, ip[ -1 ] == OpCode::op_jz ? "op_jz" : "op_jmp",
-					std::to_string( value.data.int32[ 0 ] ) ) ); //  +", -> " + std::to_string( relative_address ) ) );
+					std::to_string( value.data.int32[ 0 ] ) +", -> " + std::to_string( relative_address ) ) );
 				break;
 			}
 			default:
