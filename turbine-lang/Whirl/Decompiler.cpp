@@ -97,7 +97,7 @@ AstNode* alloc_simple_node( NodeAllocator& allocator, const std::string& node_id
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_simple;
 	node->children = std::vector< AstNode* >{ child };
-	node->is_statement = false;
+	node->static_var = false;
 
 	return node;
 }
@@ -110,7 +110,7 @@ AstNode* alloc_complex_node( NodeAllocator& allocator, const std::string& node_i
 	node->node_group = AstNodeGroup::node_complex;
 	node->children = std::vector< AstNode* >{ lhs_child, rhs_child };
 	node->var_id_to = var_id_to;
-	node->is_statement = false;
+	node->static_var = true;
 
 	return node;
 }
@@ -122,7 +122,7 @@ AstNode* alloc_list_node( NodeAllocator& allocator, const std::string& node_id,
 	node->node_type = node_type;
 	node->node_group = AstNodeGroup::node_list;
 	node->children = children;
-	node->is_statement = false;
+	node->static_var = false;
 
 	return node;
 }
@@ -135,7 +135,7 @@ AstNode* alloc_const_node( NodeAllocator& allocator, const std::string& node_id,
 	node->node_group = AstNodeGroup::node_constant;
 	node->constant = constant;
 	node->var_id_to = var_id_to;
-	node->is_statement = false;
+	node->static_var = true;
 
 	return node;
 }
@@ -148,24 +148,50 @@ AstNode* alloc_identifier_node( NodeAllocator& allocator, const std::string& nod
 	node->node_group = AstNodeGroup::node_name;
 	node->var_id_from = var_id_from;
 	node->var_id_to = var_id_to;
-	node->is_statement = false;
+	node->static_var = true;
 	
 	return node;
 }
 
-AstNode* alloc_assign_node( NodeAllocator& allocator, const std::string& node_id, const std::string& var_id_to, AstNode* expr_node ) {
+AstNode* alloc_assign_node( NodeAllocator& allocator, const std::string& node_id,
+	const std::string& var_id_from, const std::string& var_id_to ) {
 	auto node = allocator.alloc_node();
 	node->node_id = node_id;
 	node->node_type = AstNodeType::node_assign;
 	node->node_group = AstNodeGroup::node_complex;
+	node->var_id_from = var_id_from;
 	node->var_id_to = var_id_to;
-	node->children = std::vector< AstNode* >{ expr_node };
-	node->is_statement = true;
+	node->static_var = true;
+	node->children = std::vector< AstNode* >{ };
 
 	return node;
 }
 
-AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std::string& node_id, bool expressions_only ) {
+void nodes_with_dependency( const std::vector< AstNode* >& nodes, const std::string& var_id, std::vector< AstNode* >* out_dep_nodes ) {
+	std::deque< AstNode* > queue;
+
+	for ( auto node : nodes ) {
+		queue.push_front( node );
+	}
+
+	do {
+		auto node = queue.front();
+
+		std::copy(
+			node->children.begin(),
+			node->children.end(),
+			std::back_inserter( queue )
+		);
+
+		if ( node->var_id_from == var_id ) {
+			out_dep_nodes->push_back( node );
+		}
+
+		queue.pop_front();
+	} while ( !queue.empty() );
+}
+
+std::vector< AstNode* >::iterator find_node( std::vector< AstNode* >& mutable_nodes, const std::string& node_id ) {
 	auto find_result = std::find_if( mutable_nodes.begin(), mutable_nodes.end(), [ &node_id ]( const AstNode* node ) {
 		return node->node_id == node_id;
 	} );
@@ -174,14 +200,25 @@ AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std
 		throw new std::exception( ( "Node \"" + node_id + "\" not found" ).c_str() );
 	}
 
-	auto found_node = *find_result;
+	return find_result;
+}
 
-	if ( found_node->is_statement && expressions_only ) {
-		return NULL;
-	} else {
-		mutable_nodes.erase( find_result );
-		return found_node;
+AstNode* find_and_remove_node( std::vector< AstNode* >& mutable_nodes, const std::string& node_id ) {
+	auto find_result = find_node( mutable_nodes, node_id );
+	auto find_node = *find_result;
+
+	if ( find_node->var_id_to.length() > 0 ) {
+		// Check dependency graph for nodes that depend on the value produced by this (found) node
+		std::vector< AstNode* > dependent_nodes;
+		nodes_with_dependency( mutable_nodes, find_node->var_id_to, &dependent_nodes );
+
+		if ( dependent_nodes.size() > 0 ) {
+			return NULL;
+		}
 	}
+
+	mutable_nodes.erase( find_result );
+	return find_node;
 }
 
 void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue >& mutable_stack, StackValue* out_value = NULL, AstNode** out_node = NULL ) {
@@ -192,7 +229,7 @@ void stack_pop( std::vector< AstNode* >& mutable_nodes, std::vector< StackValue 
 	auto stack_value = mutable_stack[ mutable_stack.size() - 1 ];
 	mutable_stack.pop_back();
 
-	auto node = find_and_remove_node( mutable_nodes, stack_value.node_id, true );
+	auto node = find_and_remove_node( mutable_nodes, stack_value.node_id );
 
 	if ( out_value ) {
 		*out_value = stack_value;
@@ -258,23 +295,22 @@ void parse_block(
 			auto slot = block.code.at( cursor++ );
 
 			auto& assign_dst = stack[ slot ];
+			auto& assign_src = stack[ stack.size() - 1 ];
 
-			AstNode* src_node = NULL;
-			StackValue assign_src;
-
-			stack_pop( nodes, stack, &assign_src, &src_node );
+			// Var gets re-assigned, remove static flag
+			auto dst_node = find_node( nodes, assign_dst.node_id );
+			( *dst_node )->static_var = false;
 
 			auto node_id = gen_node_id();
 
 			auto node = alloc_assign_node(
 				allocator,
 				node_id,
-				assign_dst.var_id,
-				src_node
+				assign_src.var_id,
+				assign_dst.var_id
 			);
 
 			nodes.push_back( node );
-			stack.push_back( StackValue{ gen_var_id(), node_id } );
 			break;
 		}
 		case OpCode::op_ne:

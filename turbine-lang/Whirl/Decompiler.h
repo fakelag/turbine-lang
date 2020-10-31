@@ -36,7 +36,8 @@ struct AstNode {
 	std::string						var_id_from;
 	std::string						var_id_to;
 	double							constant;
-	bool							is_statement;
+
+	bool							static_var;
 };
 
 void jit_decompile( const Function& function, std::vector< AstNode* >* out_ast );
