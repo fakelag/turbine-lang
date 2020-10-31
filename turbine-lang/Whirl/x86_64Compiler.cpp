@@ -30,13 +30,15 @@
 
 #define REG_CONST_TABLE REG_RCX
 
+#define USE_OPTIMIZATIONS 1
+
 enum LocationType {
 	location_stack,
 	location_xmm,
 };
 
 struct Identifier {
-	Identifier( const std::string& name, LocationType loc_type, uint32_t loc, uint32_t hydr_count, bool is_const, uint32_t const_index ) {
+	Identifier( const std::string& name, LocationType loc_type, uint32_t loc, uint32_t hydr_count, bool static_var ) {
 		static int s_identifier_uuid = 0;
 
 		names.push_back( name );
@@ -44,8 +46,7 @@ struct Identifier {
 		location_type = loc_type;
 		location = loc;
 		hydrate_count = hydr_count;
-		is_constant = is_const;
-		constant_index = const_index;
+		is_static = static_var;
 	}
 
 	bool has_name( const std::string& name ) const {
@@ -57,9 +58,7 @@ struct Identifier {
 	LocationType location_type;
 	uint32_t location;
 	uint32_t hydrate_count;
-
-	bool is_constant;
-	uint32_t constant_index;
+	bool is_static;
 };
 
 struct JitContext {
@@ -155,24 +154,14 @@ void label_patch_byte( JitContext* context, Label* label ) {
 	}
 }
 
-void create_identifier( JitContext* context, uint32_t xmm_location, const std::string& name ) {
-	context->identifiers.emplace_back( name, LocationType::location_xmm, xmm_location, context->hydrate_count, false, 0 );
-}
-
-void create_constant_identifier( JitContext* context, uint32_t xmm_location, const std::string& name, uint32_t const_index ) {
-	context->identifiers.emplace_back( name, LocationType::location_xmm, xmm_location, context->hydrate_count, true, const_index );
-}
-
-Identifier* find_identifier_constant_in_xmm( JitContext* context, uint32_t constant_index ) {
-	auto find_result = std::find_if( context->identifiers.begin(), context->identifiers.end(), [ constant_index ]( const Identifier& id ) {
-		return id.is_constant && id.location_type == LocationType::location_xmm && id.constant_index == constant_index;
-	} );
-
-	if ( find_result == context->identifiers.end() ) {
-		return NULL;
-	}
-
-	return &*find_result;
+void create_identifier( JitContext* context, uint32_t xmm_location, const std::string& name, bool is_static ) {
+	context->identifiers.emplace_back(
+		name,
+		LocationType::location_xmm,
+		xmm_location,
+		context->hydrate_count,
+		is_static
+	);
 }
 
 Identifier* find_identifier_by_name( JitContext* context, const std::string& name ) {
@@ -266,36 +255,6 @@ int32_t jit_alloc_xmm( JitContext* context ) {
 	}
 }
 
-bool find_foldable_const_identifier( JitContext* context, AstNode* node, uint32_t* out_const_node, uint32_t* out_const_index ) {
-	if ( node->node_type == AstNodeType::node_eq || node->node_type == AstNodeType::node_ne ) {
-		return false;
-	}
-
-	int node_index = node->node_type == AstNodeType::node_sub || node->node_type == AstNodeType::node_div
-		? 1
-		: 0;
-
-	for ( ; node_index < 2; ++node_index ) {
-		auto child = node->children[ node_index ];
-
-		if ( child->node_type != AstNodeType::node_const ) {
-			continue;
-		}
-
-		uint32_t constant_index = jit_add_constant( context, child->constant );
-
-		if ( find_identifier_constant_in_xmm( context, constant_index ) == NULL ) {
-			// Constant is loaded in the table but is not present in a register
-			// Use a direct constant operation
-			*out_const_node = node_index;
-			*out_const_index = constant_index;
-			return true;
-		}
-	}
-
-	return false;
-}
-
 void hydrate_identifier( JitContext* context, Identifier* identifier ) {
 	if ( identifier->location_type == LocationType::location_stack ) {
 		auto xmm = jit_alloc_xmm( context );
@@ -316,26 +275,25 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 		assert( node->var_id_to.length() > 0 );
 
 		auto constant_index = jit_add_constant( context, node->constant );
-		auto constant_identifier = find_identifier_constant_in_xmm( context, constant_index );
+		auto xmm = jit_alloc_xmm( context );
 
-		if ( constant_identifier ) {
-			constant_identifier->names.push_back( node->var_id_to );
-		} else {
-			auto xmm = jit_alloc_xmm( context );
-			asm_mov_xmm_const( context, xmm, constant_index );
-
-			create_constant_identifier( context, xmm, node->var_id_to, constant_index );
-		}
+		asm_mov_xmm_const( context, xmm, constant_index );
+		create_identifier( context, xmm, node->var_id_to, node->static_var );
 		break;
 	}
 	case AstNodeType::node_identifier: {
 		auto referred_identifier = find_identifier_by_name( context, node->var_id_from );
 		hydrate_identifier( context, referred_identifier );
 
-		auto xmm = jit_alloc_xmm( context );
-		asm_mov_xmm_xmm( context, xmm, referred_identifier->location );
+		if ( USE_OPTIMIZATIONS && node->static_var && referred_identifier->is_static ) {
+			// Both variables never get re-assigned
+			referred_identifier->names.push_back( node->var_id_to );
+		} else {
+			auto xmm = jit_alloc_xmm( context );
+			asm_mov_xmm_xmm( context, xmm, referred_identifier->location );
 
-		create_identifier( context, xmm, node->var_id_to );
+			create_identifier( context, xmm, node->var_id_to, node->static_var );
+		}
 		break;
 	}
 	case AstNodeType::node_ne:
@@ -344,91 +302,66 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 	case AstNodeType::node_mul:
 	case AstNodeType::node_sub:
 	case AstNodeType::node_add: {
-		uint32_t const_node, const_index;
-		if ( find_foldable_const_identifier( context, node, &const_node, &const_index ) ) {
-			int other_node = 1 - const_node;
+		jit_recursive( context, node->children[ 0 ] );
+		jit_recursive( context, node->children[ 1 ] );
 
-			jit_recursive( context, node->children[ other_node ] );
+		auto left_identifier = find_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+		auto right_identifier = find_identifier_by_name( context, node->children[ 1 ]->var_id_to );
 
-			auto identifier = find_identifier_by_name( context, node->children[ other_node ]->var_id_to );
-			hydrate_identifier( context, identifier );
+		hydrate_identifier( context, left_identifier );
+		hydrate_identifier( context, right_identifier );
 
-			assert( identifier->location_type == LocationType::location_xmm );
+		assert( left_identifier->location_type == LocationType::location_xmm );
+		assert( right_identifier->location_type == LocationType::location_xmm );
 
-			auto target_xmm = identifier->location;
+		auto target_xmm = left_identifier->location;
 
-			switch ( node->node_type ) {
-			case AstNodeType::node_add: asm_add_xmm_const( context, target_xmm, const_index ); break;
-			case AstNodeType::node_sub: asm_sub_xmm_const( context, target_xmm, const_index ); break;
-			case AstNodeType::node_mul: asm_mul_xmm_const( context, target_xmm, const_index ); break;
-			case AstNodeType::node_div: asm_div_xmm_const( context, target_xmm, const_index ); break;
-			default: break;
-			}
+		switch ( node->node_type ) {
+		case AstNodeType::node_ne:
+		case AstNodeType::node_eq: {
+			Label jz_label;
+			Label jmp_label;
 
-			remove_identifier_by_name( context, node->children[ other_node ]->var_id_to );
-			create_identifier( context, target_xmm, node->var_id_to );
-		} else {
-			jit_recursive( context, node->children[ 0 ] );
-			jit_recursive( context, node->children[ 1 ] );
+			auto one_constant = jit_add_constant( context, 1.0 );
 
-			auto left_identifier = find_identifier_by_name( context, node->children[ 0 ]->var_id_to );
-			auto right_identifier = find_identifier_by_name( context, node->children[ 1 ]->var_id_to );
+			asm_ucomisd_xmm_xmm( context, left_identifier->location, right_identifier->location );
 
-			hydrate_identifier( context, left_identifier );
-			hydrate_identifier( context, right_identifier );
-
-			assert( left_identifier->location_type == LocationType::location_xmm );
-			assert( right_identifier->location_type == LocationType::location_xmm );
-
-			auto target_xmm = left_identifier->location;
-
-			switch ( node->node_type ) {
-			case AstNodeType::node_ne:
-			case AstNodeType::node_eq: {
-				Label jz_label;
-				Label jmp_label;
-
-				auto one_constant = jit_add_constant( context, 1.0 );
-
-				asm_ucomisd_xmm_xmm( context, left_identifier->location, right_identifier->location );
-
-				asm_jz_rel8( context, 0xFF );
-				label_emplace( context, &jz_label, 0x1 );
+			asm_jz_rel8( context, 0xFF );
+			label_emplace( context, &jz_label, 0x1 );
 				
-				if ( node->node_type == AstNodeType::node_eq ) {
-					asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
-				} else {
-					asm_mov_xmm_const( context, target_xmm, one_constant );
-				}
-
-				asm_jmp_rel8( context, 0xFF );
-				label_emplace( context, &jmp_label, 0x1 );
-
-				label_target( context, &jz_label );
-				label_patch_byte( context, &jz_label );
-
-				if ( node->node_type == AstNodeType::node_eq ) {
-					asm_mov_xmm_const( context, target_xmm, one_constant );
-				} else {
-					asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
-				}
-
-				label_target( context, &jmp_label );
-				label_patch_byte( context, &jmp_label );
-				break;
-			}
-			case AstNodeType::node_add: asm_add_xmm_xmm( context, target_xmm, right_identifier->location ); break;
-			case AstNodeType::node_sub: asm_sub_xmm_xmm( context, target_xmm, right_identifier->location ); break;
-			case AstNodeType::node_mul: asm_mul_xmm_xmm( context, target_xmm, right_identifier->location ); break;
-			case AstNodeType::node_div: asm_div_xmm_xmm( context, target_xmm, right_identifier->location ); break;
-			default: break;
+			if ( node->node_type == AstNodeType::node_eq ) {
+				asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
+			} else {
+				asm_mov_xmm_const( context, target_xmm, one_constant );
 			}
 
-			remove_identifier_by_name( context, node->children[ 0 ]->var_id_to );
-			remove_identifier_by_name( context, node->children[ 1 ]->var_id_to );
+			asm_jmp_rel8( context, 0xFF );
+			label_emplace( context, &jmp_label, 0x1 );
 
-			create_identifier( context, target_xmm, node->var_id_to );
+			label_target( context, &jz_label );
+			label_patch_byte( context, &jz_label );
+
+			if ( node->node_type == AstNodeType::node_eq ) {
+				asm_mov_xmm_const( context, target_xmm, one_constant );
+			} else {
+				asm_pxor_xmm( context, left_identifier->location, left_identifier->location );
+			}
+
+			label_target( context, &jmp_label );
+			label_patch_byte( context, &jmp_label );
+			break;
 		}
+		case AstNodeType::node_add: asm_add_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+		case AstNodeType::node_sub: asm_sub_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+		case AstNodeType::node_mul: asm_mul_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+		case AstNodeType::node_div: asm_div_xmm_xmm( context, target_xmm, right_identifier->location ); break;
+		default: break;
+		}
+
+		remove_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+		remove_identifier_by_name( context, node->children[ 1 ]->var_id_to );
+
+		create_identifier( context, target_xmm, node->var_id_to, node->static_var );
 		break;
 	}
 	case AstNodeType::node_return: {
@@ -506,14 +439,8 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 		break;
 	}
 	case AstNodeType::node_assign: {
-		jit_recursive( context, node->children[ 0 ] );
-
-		auto identifier_src = find_identifier_by_name( context, node->children[ 0 ]->var_id_to );
+		auto identifier_src = find_identifier_by_name( context, node->var_id_from );
 		auto identifier_dst = find_identifier_by_name( context, node->var_id_to );
-
-		if ( identifier_src->is_constant ) {
-			throw std::exception( "Cant assign to a constant" );
-		}
 
 		// TODO optimization: can get rid of hydrates here by assigning directly to stack
 		hydrate_identifier( context, identifier_src );
@@ -521,10 +448,9 @@ void jit_recursive( JitContext* context, AstNode* node ) {
 
 		assert( identifier_src->location_type == LocationType::location_xmm );
 		assert( identifier_dst->location_type == LocationType::location_xmm );
+		assert( identifier_dst->is_static == false );
 
 		asm_mov_xmm_xmm( context, identifier_dst->location, identifier_src->location );
-
-		// CAN SRC IDENTIFIER BE REMOVED????
 		break;
 	}
 	default:
